@@ -1,0 +1,11 @@
+# Python dependencies for the local speech server (asr_server.py) and learner.py
+# Install: uv pip install --python .venv/bin/python -r requirements.txt
+mlx==0.32.3
+mlx-audio==0.5.8
+mlx-lm==0.32.0
+numpy==2.5.4
+huggingface-hub==2.2.0
+transformers==5.19.0   # required: mlx-audio imports it when loading speech models
+sentencepiece==0.2.2
+pypinyin==0.55.0
+rapidfuzz==3.14.6
