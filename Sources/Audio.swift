@@ -12,6 +12,8 @@ final class AudioRecorder {
     var noiseMode = true
     /// Record from the built-in mic when the default input is a Bluetooth headset.
     var preferBuiltIn = true
+    /// UID of a mic pinned in Settings ("" = automatic). Used when that mic is plugged in.
+    var pinnedMic = ""
     /// True when the engine in use runs with voice processing (may be false even if noiseMode is on).
     private(set) var voiceProcessingActive = false
     /// Input devices where voice processing produced no audio or stopped the engine. Plain capture is used for them.
@@ -60,6 +62,17 @@ final class AudioRecorder {
 
     var isRecording: Bool { lock.withLock { recording } }
 
+    /// Samples captured so far in the current take (16 kHz mono, pre-roll included). Thread-safe.
+    var sampleCount: Int { lock.withLock { samples.count } }
+
+    /// A copy of samples[from..<to] of the current take (clamped). Thread-safe; used for live segment recognition.
+    func samples(from: Int, to: Int) -> [Float] {
+        lock.withLock {
+            let a = max(0, min(from, samples.count)), b = max(a, min(to, samples.count))
+            return Array(samples[a..<b])
+        }
+    }
+
     deinit { shutdown() }
 
     static func requestPermission(_ done: @escaping (Bool) -> Void) {
@@ -74,7 +87,7 @@ final class AudioRecorder {
         idleTimer?.cancel()
         idleTimer = nil
         // a warm engine stays bound to the device it was built on: rebuild if the mic changed (headphones unplugged)
-        let target = DeviceInfo.recordingInput(preferBuiltIn: preferBuiltIn)
+        let target = DeviceInfo.recordingInput(preferBuiltIn: preferBuiltIn, pinnedUID: pinnedMic)
         let useCapture = target != Self.defaultInputDevice()
         let isRunningNow = engine?.isRunning == true || capture?.isRunning == true
         if !isRunningNow || builtDevice != target || (capture != nil) != useCapture || (!useCapture && builtVP != wantVP()) {
@@ -350,7 +363,7 @@ final class AudioRecorder {
         }
     }
 
-    private static func wav(from pcm: [Float]) -> Data {
+    static func wav(from pcm: [Float]) -> Data {
         let dataBytes = UInt32(pcm.count * 2)
         var d = Data(capacity: 44 + Int(dataBytes))
         func append<T: FixedWidthInteger>(_ v: T) {

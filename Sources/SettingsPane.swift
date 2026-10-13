@@ -7,6 +7,7 @@ final class SettingsPane: NSViewController {
     var onToggleForceClick: ((Bool) -> Void)?
     var onToggleNoiseMode: ((Bool) -> Void)?
     var onTogglePreferBuiltIn: ((Bool) -> Void)?
+    var onToggleLivePreview: ((Bool) -> Void)?
     var onChangePolish: ((String) -> Void)?      // "fast" | "auto" | "local"
     var onToggleTwoPass: ((Bool) -> Void)?
     var onToggleLaunchAtLogin: ((Bool) -> Void)?
@@ -14,6 +15,10 @@ final class SettingsPane: NSViewController {
     var onToggleAutoSend: ((Bool) -> Void)?
     var onToggleOffline: ((Bool) -> Void)?
     var onChangeAppStyle: ((String, String) -> Void)?   // (bundleID, style) ; style "" = remove user override
+    var onChangeMic: ((String) -> Void)?                 // chosen mic uid ; "" = automatic
+    var onSavePrompt: ((String) -> Void)?                // polish prompt ; "" = use built-in prompt
+    var onOpenHooksFolder: (() -> Void)?
+    var onOpenCommands: (() -> Void)?
 
     // MARK: - Stored state
 
@@ -21,6 +26,7 @@ final class SettingsPane: NSViewController {
     private var forceClick = false
     private var noiseMode = false
     private var preferBuiltIn = true
+    private var livePreview = true
     private var polish = "fast"
     private var twoPass = false
     private var launchAtLogin = false
@@ -28,6 +34,14 @@ final class SettingsPane: NSViewController {
     private var autoSend = false
     private var offline = false
     private var appStyleRows: [(bundleID: String, name: String, style: String, isDefault: Bool)] = []
+    private var mics: [InputChoice] = []
+    private var selectedMic = ""
+    private var polishPrompt = ""          // "" = built-in prompt
+    private var builtInPrompt = ""
+    private var promptShown: String?       // text last pushed into the text view; avoids overwriting edits
+    private var hookFilter = false
+    private var hookAfter = false
+    private var commandCount = 0
 
     private static let polishValues = ["fast", "auto", "local"]
     private static let polishHints: [String: String] = [
@@ -48,6 +62,7 @@ final class SettingsPane: NSViewController {
     private var forceSwitch: NSSwitch?
     private var noiseSwitch: NSSwitch?
     private var preferBuiltInSwitch: NSSwitch?
+    private var livePreviewSwitch: NSSwitch?
     private var polishControl: NSSegmentedControl?
     private var polishHint: NSTextField?
     private var twoPassSwitch: NSSwitch?
@@ -57,6 +72,10 @@ final class SettingsPane: NSViewController {
     private var offlineSwitch: NSSwitch?
     private var appStyleStack: NSStackView?
     private var appStyleHeight: NSLayoutConstraint?
+    private var micPopup: NSPopUpButton?
+    private var promptView: NSTextView?
+    private var hooksSubtitle: NSTextField?
+    private var commandsSubtitle: NSTextField?
 
     // MARK: - Lifecycle
 
@@ -72,7 +91,6 @@ final class SettingsPane: NSViewController {
     override func loadView() {
         let root = NSView(frame: NSRect(origin: .zero, size: Self.paneSize))
         view = root
-        preferredContentSize = Self.paneSize
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
@@ -96,6 +114,8 @@ final class SettingsPane: NSViewController {
         let appStyleSection = section("按应用的风格", card: appStyleCard())
         let privacySection = section("隐私", card: privacyCard())
         let generalSection = section("通用", card: generalCard())
+        let promptSection = section("高级", card: promptCard())
+        let hooksSection = section("插件", card: hooksCard())
 
         let sections: [NSView] = [
             text("设置", size: 26, weight: .bold),
@@ -104,6 +124,8 @@ final class SettingsPane: NSViewController {
             appStyleSection,
             privacySection,
             generalSection,
+            promptSection,
+            hooksSection,
         ]
         let stack = NSStackView(views: sections)
         stack.orientation = .vertical
@@ -144,6 +166,39 @@ final class SettingsPane: NSViewController {
         applyState()
     }
 
+    /// Live preview: show recognized words in the hint box while speaking. Stored until the view loads.
+    func setLivePreview(_ on: Bool) {
+        livePreview = on
+        applyState()
+    }
+
+    /// Microphone choices for the picker. Stored until the view loads; "" = automatic.
+    func setMics(_ list: [InputChoice], selected: String) {
+        mics = list
+        selectedMic = selected
+        applyState()
+    }
+
+    /// Polish prompt. `current` = "" means built-in. Stored until the view loads.
+    func setPrompt(_ current: String, builtIn: String) {
+        polishPrompt = current
+        builtInPrompt = builtIn
+        applyState()
+    }
+
+    /// Plugin script state. Stored until the view loads.
+    func setHooks(filter: Bool, after: Bool) {
+        hookFilter = filter
+        hookAfter = after
+        applyState()
+    }
+
+    /// Voice command count for the commands row. Stored until the view loads.
+    func setCommands(count: Int) {
+        commandCount = count
+        applyState()
+    }
+
     /// Feature toggles owned by the core app. Stored until the view loads.
     func setFeatures(handsFree: Bool, autoSend: Bool, offline: Bool) {
         self.handsFree = handsFree
@@ -165,6 +220,7 @@ final class SettingsPane: NSViewController {
         forceSwitch?.state = forceClick ? .on : .off
         noiseSwitch?.state = noiseMode ? .on : .off
         preferBuiltInSwitch?.state = preferBuiltIn ? .on : .off
+        livePreviewSwitch?.state = livePreview ? .on : .off
         polishControl?.selectedSegment = Self.polishValues.firstIndex(of: polish) ?? 0
         polishHint?.stringValue = Self.polishHints[polish] ?? ""
         twoPassSwitch?.state = twoPass ? .on : .off
@@ -173,6 +229,38 @@ final class SettingsPane: NSViewController {
         autoSendSwitch?.state = autoSend ? .on : .off
         offlineSwitch?.state = offline ? .on : .off
         rebuildAppStyleList()
+        rebuildMicPopup()
+        let shownPrompt = polishPrompt.isEmpty ? builtInPrompt : polishPrompt
+        if let view = promptView, promptShown != shownPrompt {
+            view.string = shownPrompt
+            promptShown = shownPrompt
+        }
+        hooksSubtitle?.stringValue = "过滤脚本 filter：\(hookFilter ? "已启用" : "未放置") · 上屏后脚本 after：\(hookAfter ? "已启用" : "未放置")。说明见 README。"
+        commandsSubtitle?.stringValue = commandCount > 0
+            ? "已有 \(commandCount) 条口令。整句话等于口令时执行动作，不上屏文字。"
+            : "还没有口令。打开文件按例子写一行「口令 => 动作」即可。"
+    }
+
+    /// Rebuilds the mic popup: automatic first, then one item per device. No-op until the view loads.
+    private func rebuildMicPopup() {
+        guard let popup = micPopup else { return }
+        popup.removeAllItems()
+        let auto = NSMenuItem(title: "自动（跟随系统）", action: nil, keyEquivalent: "")
+        auto.representedObject = ""
+        popup.menu?.addItem(auto)
+        for mic in mics {
+            let item = NSMenuItem(title: "\(mic.name)（\(mic.transport)）", action: nil, keyEquivalent: "")
+            item.representedObject = mic.uid
+            popup.menu?.addItem(item)
+        }
+        if !selectedMic.isEmpty && !mics.contains(where: { $0.uid == selectedMic }) {
+            let missing = NSMenuItem(title: "已拔出：上次选的麦克风", action: nil, keyEquivalent: "")
+            missing.representedObject = selectedMic
+            missing.isEnabled = false
+            popup.menu?.addItem(missing)
+        }
+        let index = popup.itemArray.firstIndex(where: { ($0.representedObject as? String) == selectedMic }) ?? 0
+        popup.selectItem(at: index)
     }
 
     // MARK: - Cards
@@ -230,11 +318,26 @@ final class SettingsPane: NSViewController {
         let twoPassRow = row(symbol: "text.cursor", color: .systemGreen, title: "先上屏，再自动纠错",
                              subtitle: "像豆包：1–3 秒后原地替换为润色版", control: twoPassSw, textWidth: 480)
 
+        let micSelect = NSPopUpButton(frame: .zero, pullsDown: false)
+        micSelect.target = self
+        micSelect.action = #selector(micChanged(_:))
+        micSelect.setContentHuggingPriority(.required, for: .horizontal)
+        micPopup = micSelect
+        let micRow = row(symbol: "mic.fill", color: .systemBlue, title: "麦克风",
+                         subtitle: "自动：插耳机用耳机麦，戴蓝牙耳机用 Mac 麦克风。也可以固定一个。",
+                         control: micSelect, textWidth: 480)
+
         let preferSw = makeSwitch(#selector(preferBuiltInChanged(_:)))
         preferBuiltInSwitch = preferSw
         let preferRow = row(symbol: "airpodspro", color: .systemTeal, title: "戴蓝牙耳机时用 Mac 麦克风",
                             subtitle: "耳机只放声音，不切换通话 / 降噪模式，开口快约 0.5 秒。合上屏幕时自动改用耳机麦克风。",
                             control: preferSw, textWidth: 480)
+
+        let livePreviewSw = makeSwitch(#selector(livePreviewChanged(_:)))
+        livePreviewSwitch = livePreviewSw
+        let livePreviewRow = row(symbol: "text.bubble.fill", color: .systemPink, title: "边说边显示文字",
+                                 subtitle: "说话时在提示框里实时显示识别到的字。松开后上屏的仍是整句精确识别的结果。首次开启会下载约 237 MB 的实时模型。",
+                                 control: livePreviewSw, textWidth: 480)
 
         let noiseSw = makeSwitch(#selector(noiseModeChanged(_:)))
         noiseSwitch = noiseSw
@@ -248,7 +351,68 @@ final class SettingsPane: NSViewController {
                               subtitle: "句尾单独说“发送 / 回车 / 发出去”时，上屏后自动按回车",
                               control: autoSendSw, textWidth: 480)
 
-        return card([polishRow, twoPassRow, preferRow, noiseRow, autoSendRow])
+        return card([polishRow, twoPassRow, micRow, preferRow, livePreviewRow, noiseRow, autoSendRow])
+    }
+
+    private func promptCard() -> NSView {
+        let titleRow = row(symbol: "text.bubble", color: .systemPurple, title: "润色提示词",
+                           subtitle: "云端润色时发给模型的系统指令。改坏了点「恢复默认」。防改写检查始终生效。",
+                           control: nil, textWidth: 560)
+
+        let textView = NSTextView()
+        textView.font = NSFont.systemFont(ofSize: 13)
+        textView.isRichText = false
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        textView.minSize = NSSize(width: 0, height: 140)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        promptView = textView
+
+        let editorScroll = NSScrollView()
+        editorScroll.hasVerticalScroller = true
+        editorScroll.borderType = .bezelBorder
+        editorScroll.documentView = textView
+        editorScroll.heightAnchor.constraint(equalToConstant: 140).isActive = true
+
+        let saveButton = modernButton("保存", symbol: nil, prominent: true, action: #selector(savePromptTapped))
+        let resetButton = modernButton("恢复默认", symbol: "arrow.counterclockwise", prominent: false,
+                                       action: #selector(resetPromptTapped))
+        let buttons = horizontal([saveButton, resetButton], spacing: 8)
+
+        let editor = NSStackView(views: [editorScroll, buttons])
+        editor.orientation = .vertical
+        editor.alignment = .leading
+        editor.spacing = 10
+        editor.edgeInsets = NSEdgeInsets(top: 0, left: 14, bottom: 14, right: 14)
+        fillWidth([editorScroll], in: editor, inset: 28)
+
+        let content = NSStackView(views: [titleRow, editor])
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 0
+        fillWidth([titleRow, editor], in: content, inset: 0)
+        return glassContainer(content)
+    }
+
+    private func hooksCard() -> NSView {
+        let subtitle = text("", size: 11, color: .secondaryLabelColor)
+        subtitle.preferredMaxLayoutWidth = 480
+        hooksSubtitle = subtitle
+        let openButton = modernButton("打开文件夹", symbol: "folder", prominent: false,
+                                      action: #selector(openHooksFolderTapped))
+        let hooksRow = row(symbol: "puzzlepiece.extension", color: .systemGreen, title: "插件脚本",
+                           subtitle: nil, customSubtitle: subtitle, control: openButton, textWidth: 480)
+        let commandsSub = text("", size: 11, color: .secondaryLabelColor)
+        commandsSub.preferredMaxLayoutWidth = 480
+        commandsSubtitle = commandsSub
+        let commandsButton = modernButton("打开口令文件", symbol: nil, prominent: false,
+                                          action: #selector(openCommandsTapped))
+        let commandsRow = row(symbol: "command", color: .systemIndigo, title: "语音口令",
+                              subtitle: nil, customSubtitle: commandsSub, control: commandsButton, textWidth: 480)
+        return card([hooksRow, commandsRow])
     }
 
     private func appStyleCard() -> NSView {
@@ -620,6 +784,11 @@ final class SettingsPane: NSViewController {
         onTogglePreferBuiltIn?(preferBuiltIn)
     }
 
+    @objc private func livePreviewChanged(_ sender: NSSwitch) {
+        livePreview = sender.state == .on
+        onToggleLivePreview?(livePreview)
+    }
+
     @objc private func polishChanged(_ sender: NSSegmentedControl) {
         let index = max(0, min(sender.selectedSegment, Self.polishValues.count - 1))
         polish = Self.polishValues[index]
@@ -660,6 +829,36 @@ final class SettingsPane: NSViewController {
             appStyleRows[i].style = style
         }
         onChangeAppStyle?(bundleID, style)
+    }
+
+    @objc private func micChanged(_ sender: NSPopUpButton) {
+        selectedMic = sender.selectedItem?.representedObject as? String ?? ""
+        onChangeMic?(selectedMic)
+    }
+
+    @objc private func savePromptTapped() {
+        guard let view = promptView else { return }
+        let edited = view.string
+        let builtIn = builtInPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isBuiltIn = edited.trimmingCharacters(in: .whitespacesAndNewlines) == builtIn
+        polishPrompt = isBuiltIn ? "" : edited
+        promptShown = polishPrompt.isEmpty ? builtInPrompt : polishPrompt
+        onSavePrompt?(polishPrompt)
+    }
+
+    @objc private func resetPromptTapped() {
+        polishPrompt = ""
+        promptShown = builtInPrompt
+        promptView?.string = builtInPrompt
+        onSavePrompt?("")
+    }
+
+    @objc private func openHooksFolderTapped() {
+        onOpenHooksFolder?()
+    }
+
+    @objc private func openCommandsTapped() {
+        onOpenCommands?()
     }
 
     @objc private func addAppTapped(_ sender: NSButton) {

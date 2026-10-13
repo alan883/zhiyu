@@ -67,6 +67,7 @@ Zhiyu has three goals: fast, accurate, and fluent. It is free. All audio stays o
 - Force-click the trackpad as an alternative to the hotkey.
 - Hands-free: double-tap the hotkey to keep recording. Press once more to stop.
 - Mic awareness: shows the current microphone (built-in, wired headset, or Bluetooth). It rebuilds the audio pipeline when you plug or unplug headphones.
+- Pin a microphone in Settings. If it is unplugged, Zhiyu falls back to automatic.
 - Bluetooth headphones: by default Zhiyu records from the built-in Mac microphone and the headphones only play sound. Turn this off in Settings. With the lid closed, the built-in mic is off, so Zhiyu uses the headset mic.
 - The ready sound plays only after real audio arrives. Start speaking after the sound and the first word is not cut.
 
@@ -102,6 +103,45 @@ Zhiyu has three goals: fast, accurate, and fluent. It is free. All audio stays o
 - Landscape window with a sidebar: Overview, Settings, Models, Dictionary, History.
 - Built-in history search and copy.
 - The Overview page shows where each step runs.
+
+### Live text while speaking
+
+- While you speak, the HUD shows the words as they are recognized. This uses Alibaba's streaming Paraformer on the CPU, so it does not compete with the final recognizer on the GPU.
+- After you release the key, the inserted text still comes from the accurate whole-take recognizer. This is FunASR's "2-pass" idea: the first pass for feel, the second for accuracy.
+- Measured on an M1 with 41 real takes: about 27 ms of compute per 100 ms of audio; preview text differs from the final text in about 11% of characters.
+- The first time, it downloads a ~237 MB streaming model. Turn it off in Settings.
+- We also tried cutting the take at pauses and joining segment results as the final text. Waiting after release dropped from 0.96 s to 0.41 s, but segments lose context and made 4–7% more errors, so we did not ship it.
+
+### Voice commands
+
+- If the whole utterance equals a command phrase, Zhiyu runs an action instead of typing. Commands live in `~/.config/zhiyu/commands.txt`, one per line: `phrase => action`.
+- Actions: `key:cmd+a` (keystroke), `text:...` (insert fixed text), `run:script` (run a script), `open:URL or file`.
+- Only whole-utterance matches of at most 12 characters trigger, so normal speech does not.
+
+### Automatic learning
+
+- Zhiyu learns silently in the background, with no pop-ups. Sources: your edits in the text field, what you actually sent in Claude Code, homophone fixes made by the polish, and a sentence you repeat within 1 minute.
+- Guards: a wrong→right pair must appear twice and sound alike; grammar-only changes (的/地/得/了) are never learned.
+- Learned words and correction rules are listed on the Dictionary page. Items you delete are remembered and never learned again.
+
+### Plug-in scripts (Zhiyu is a socket)
+
+Zhiyu keeps the core fast, accurate and smooth. To add your own behavior, drop a script in; no code changes needed.
+
+- Put executable scripts in `~/.config/zhiyu/hooks/` (Settings → 插件脚本 → 打开文件夹). Run `chmod +x`.
+- `filter`: runs before the text is inserted. stdin = the text, stdout = the replacement. It has 0.3 s; on timeout, error or empty output Zhiyu inserts the original.
+- `after`: runs in the background after insertion. stdin = the final text; output is ignored. Use it for logging or syncing to notes.
+- Environment: `ZHIYU_APP` (app name), `ZHIYU_BUNDLE` (bundle id, filter only), `ZHIYU_RAW` (recognizer text), `ZHIYU_MIC` (microphone).
+- Example, replace "哈哈" with "😂" in WeChat:
+
+```sh
+#!/bin/sh
+# ~/.config/zhiyu/hooks/filter
+if [ "$ZHIYU_APP" = "微信" ]; then sed 's/哈哈/😂/g'; else cat; fi
+```
+
+- Script errors go to `~/.config/zhiyu/hooks.log`.
+- The cloud polish prompt is editable in Settings, with a reset button. The faithfulness guard always applies.
 
 ### Safety
 
@@ -241,6 +281,10 @@ Roadmap:
 | `Sources/Audio.swift` | Audio capture |
 | `Sources/Clients.swift` | Config, polish, guards |
 | `Sources/DeviceInfo.swift` | Microphone info |
+| `Sources/HUD.swift` | Floating pill near the cursor (level bars, live text) |
+| `Sources/LivePreview.swift` | Live text while speaking (streaming recognition) |
+| `Sources/Commands.swift` | Voice commands |
+| `Sources/Hooks.swift` | Plug-in scripts |
 | `Sources/MainWindow.swift`, `OverviewPane`, `SettingsPane`, `ModelsPane`, `DictionaryPane`, `HistoryPane` | UI |
 | `asr_server.py` | Local MLX server on 127.0.0.1:8776 |
 | `phonetic.py` | Pinyin correction |

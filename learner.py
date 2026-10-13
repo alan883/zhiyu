@@ -102,7 +102,7 @@ def load_dictionary(path):
 def fresh_lexicon():
     return {"version": 1, "terms": [], "corrections": [], "candidates": {},
             "rejected": {"terms": [], "corrections": []},
-            "cursor": {"history": 0, "edits": 0, "claude_bytes": None}, "updated": None}
+            "cursor": {"history": 0, "edits": 0, "claude_bytes": None, "polish": 0, "redo": 0}, "updated": None}
 
 
 def rejected_sets(lex):
@@ -129,7 +129,8 @@ def load_lexicon(path):
     cur = lex["cursor"] if isinstance(lex["cursor"], dict) else {}
     cb = cur.get("claude_bytes")
     lex["cursor"] = {"history": int(cur.get("history", 0)), "edits": int(cur.get("edits", 0)),
-                     "claude_bytes": cb if isinstance(cb, int) and not isinstance(cb, bool) else None}
+                     "claude_bytes": cb if isinstance(cb, int) and not isinstance(cb, bool) else None,
+                     "polish": int(cur.get("polish", 0)), "redo": int(cur.get("redo", 0))}
     if not isinstance(lex["terms"], list):
         lex["terms"] = []
     if not isinstance(lex["corrections"], list):
@@ -436,6 +437,10 @@ def candidate_ok(key, ctx, lex, dict_terms):
         # counted only after the edit gate passed; the user's own hand-fixes are ground truth
         wrong, _, right = key[len("edit:"):].partition("→")
         return "→" in key and (wrong, right) not in rej_pairs
+    if key.startswith(("polish:", "redo:")):
+        # counted by polish_pass / redo_pass after their gates; no seed check, same as edit: pairs
+        wrong, sep, right = key.partition(":")[2].partition("→")
+        return bool(sep) and (wrong, right) not in rej_pairs
     wrong, sep, right = key.partition("→")
     return bool(sep) and (wrong, right) not in rej_pairs and verified_pair(wrong, right, ctx, lex, dict_terms)
 
@@ -735,6 +740,111 @@ def claude_edits_pass(lex, dict_terms, history):
     return len(pairs), added_terms, added_corr
 
 
+# ---------- polish / redo passes (silent, no LLM, purely local) ----------
+# polish: the cloud polish changed the raw text and the result reached the screen (swap terminal:polished* or ax,
+#         or a refined_unapplied text). Learns only sound-alike fixes, never semantic rewrites (算子→算力).
+# redo:   the user said the same thing again within REDO_WINDOW_S in the same app, so the first text was misheard.
+
+REDO_WINDOW_S = 60
+REDO_MIN_RATIO = 0.6
+
+
+def known_and_corpus(lex, dict_terms):
+    known = set(trusted_terms(lex, dict_terms))  # K, as in process_edits
+    try:
+        corpus = build_seed_corpus()  # cached daily; used only to pick word boundaries
+    except Exception:
+        corpus = ""
+    return known, corpus
+
+
+def gated_pairs(inserted, final, known, corpus):
+    """Set of (wrong, right) from one row that passed the polish/redo gates."""
+    pairs = set()
+    for wrong, right in replace_pairs(inserted, final, known, corpus):
+        if not right or not is_meaningful(wrong) or not is_meaningful(right):
+            continue  # empty right = filler removal (呃/嗯/额 dropped); punctuation/space-only sides
+        if grammar_only(wrong, right):
+            continue  # 的/地/得/了 edits are grammar, not mishearing: "的不→得不" would break "我的不对" everywhere
+        if looks_misheard(wrong, right) and edit_pair_plausible(wrong, right):
+            pairs.add((wrong, right))
+    return pairs
+
+
+PARTICLES = set("的地得了着过吗呢吧啊呀嘛么")
+
+
+def grammar_only(wrong, right):
+    """True when the two sides differ only in particle characters (measured: 4 of 9 polish pairs on 10-13 were these)."""
+    import difflib
+    sm = difflib.SequenceMatcher(None, wrong, right)
+    changed = [wrong[i1:i2] + right[j1:j2] for op, i1, i2, j1, j2 in sm.get_opcodes() if op != "equal"]
+    return all(set(c) <= PARTICLES for c in changed)
+
+
+def count_pending(lex, pairs, source, dict_terms):
+    """process_edits' pending-count-then-promote logic, with candidate keys prefixed by source."""
+    added_terms, added_corr = [], []
+    for wrong, right in sorted(pairs):
+        key = f"{source}:{wrong}→{right}"
+        n = lex["candidates"].get(key, 0) + 1
+        lex["candidates"][key] = n
+        if n < PROMOTE_AT:
+            continue
+        if add_correction(lex, wrong, right, source, 1, dict_terms):
+            added_corr.append(f"{wrong}→{right}")
+        if is_term_like(right) and term_ok(right) and add_term(lex, right, dict_terms):
+            added_terms.append(right)
+    return added_terms, added_corr
+
+
+def polish_pass(lex, rows, dict_terms):
+    """rows: history rows past the polish cursor. Source name: "polish"."""
+    known, corpus = known_and_corpus(lex, dict_terms)
+    added_terms, added_corr = [], []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        refined = str_field(row, "refined_unapplied")
+        swap = str_field(row, "swap")
+        if refined:
+            final = refined
+        elif swap.startswith("terminal:polished") or swap == "ax":
+            final = str_field(row, "clean")
+        else:
+            continue
+        inserted = str_field(row, "raw")
+        if not inserted or not final or inserted == final:
+            continue
+        t, c = count_pending(lex, gated_pairs(inserted, final, known, corpus), "polish", dict_terms)
+        added_terms += t
+        added_corr += c
+    return added_terms, added_corr
+
+
+def redo_pass(lex, rows, dict_terms):
+    """rows: history rows from (redo cursor - 1) on; each pair (rows[k-1], rows[k]) is judged once.
+    Source name: "redo". Only pairs whose later row is past the cursor are new."""
+    known, corpus = known_and_corpus(lex, dict_terms)
+    added_terms, added_corr = [], []
+    for k in range(1, len(rows)):
+        a, b = rows[k - 1], rows[k]
+        if not isinstance(a, dict) or not isinstance(b, dict) or str_field(a, "app") != str_field(b, "app"):
+            continue
+        ta, tb = dictation_epoch(str_field(a, "ts")), dictation_epoch(str_field(b, "ts"))
+        if ta is None or tb is None or not 0 <= tb - ta <= REDO_WINDOW_S:
+            continue
+        ca, cb = str_field(a, "clean"), str_field(b, "clean")
+        if not ca or not cb or ca == cb:
+            continue
+        if difflib.SequenceMatcher(None, ca, cb).ratio() < REDO_MIN_RATIO:
+            continue
+        t, c = count_pending(lex, gated_pairs(ca, cb, known, corpus), "redo", dict_terms)
+        added_terms += t
+        added_corr += c
+    return added_terms, added_corr
+
+
 # ---------- LLM pass ----------
 
 def read_config():
@@ -896,7 +1006,18 @@ def process(paths):
     n_claude, claude_terms, claude_corr = claude_edits_pass(lex, dict_terms, history)
     added_terms += claude_terms
     added_corr += claude_corr
-    if not new_hist and not new_edits and not n_claude and lex["cursor"]["claude_bytes"] == claude_before:
+    # polish reads rows past its cursor; redo starts one row back so a pair straddling the old cursor is judged
+    polish_rows = history[lex["cursor"]["polish"]:]
+    redo_rows = history[max(lex["cursor"]["redo"] - 1, 0):] if lex["cursor"]["redo"] < len(history) else []
+    p_terms, p_corr = polish_pass(lex, polish_rows, dict_terms)
+    r_terms, r_corr = redo_pass(lex, redo_rows, dict_terms)
+    lex["cursor"]["polish"] = len(history)
+    lex["cursor"]["redo"] = len(history)
+    added_terms += p_terms + r_terms
+    added_corr += p_corr + r_corr
+    pass_note = f"polish=+{len(p_corr)} redo=+{len(r_corr)}"
+    if (not new_hist and not new_edits and not n_claude and lex["cursor"]["claude_bytes"] == claude_before
+            and not polish_rows and not redo_rows):
         return
 
     ctx = build_context(history)
@@ -923,7 +1044,8 @@ def process(paths):
     lex["updated"] = datetime.now().astimezone().isoformat(timespec="seconds")
     write_lexicon(paths["lexicon"], lex)
     append_log(paths["log"], datetime.now().strftime("%Y-%m-%dT%H:%M"),
-               added_terms, added_corr, len(lex["candidates"]), err, len(ctx["vocab"]), n_claude, note=note)
+               added_terms, added_corr, len(lex["candidates"]), err, len(ctx["vocab"]), n_claude,
+               note=" ".join(x for x in (note, pass_note) if x))
 
 
 def main():

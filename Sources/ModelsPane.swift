@@ -63,7 +63,6 @@ final class ModelsPane: NSViewController {
     override func loadView() {
         let root = NSView(frame: NSRect(origin: .zero, size: Self.paneSize))
         view = root
-        preferredContentSize = Self.paneSize
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true

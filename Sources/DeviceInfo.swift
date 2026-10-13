@@ -22,6 +22,12 @@ struct InputDevice: Equatable {
     }
 }
 
+struct InputChoice: Equatable {
+    let uid: String
+    let name: String
+    let transport: String
+}
+
 enum DeviceInfo {
     private static var listener: AudioObjectPropertyListenerBlock?
     private static var sourceListener: AudioObjectPropertyListenerBlock?
@@ -73,6 +79,32 @@ enum DeviceInfo {
         return ids.first { transportName($0) == "内置" && hasInputStreams($0) }
     }
 
+    /// All audio device IDs known to the system, in system order.
+    private static func allDeviceIDs() -> [AudioDeviceID] {
+        var addr = address(kAudioHardwarePropertyDevices)
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size) == noErr else { return [] }
+        var ids = [AudioDeviceID](repeating: kAudioObjectUnknown,
+                                  count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+        return ids
+    }
+
+    /// Physical input devices (virtual and aggregate devices skipped) with a UID, in system order.
+    static func allInputs() -> [InputChoice] {
+        allDeviceIDs().compactMap { id -> InputChoice? in
+            guard hasInputStreams(id), transportName(id) != "虚拟", let devUID = uid(id) else { return nil }
+            let name = deviceName(id)
+            return InputChoice(uid: devUID, name: name, transport: inputTransport(id, name: name))
+        }
+    }
+
+    /// Input device ID whose UID equals `uid`, or nil if it is not connected or has no input streams.
+    static func deviceID(forUID uid: String) -> AudioDeviceID? {
+        allDeviceIDs().first { self.uid($0) == uid && hasInputStreams($0) }
+    }
+
     /// True when the device exposes at least one input stream.
     private static func hasInputStreams(_ id: AudioDeviceID) -> Bool {
         var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams,
@@ -104,7 +136,9 @@ enum DeviceInfo {
     /// Device to record from. With preferBuiltIn, a Bluetooth default input is replaced by the
     /// built-in mic (the headset then stays in music mode and starts ~0.5 s faster), unless the
     /// lid is closed (built-in mic is off then) or no built-in mic exists.
-    static func recordingInput(preferBuiltIn: Bool) -> AudioDeviceID {
+    /// pinnedUID: a mic the user chose in Settings; if it is unplugged, fall back to automatic.
+    static func recordingInput(preferBuiltIn: Bool, pinnedUID: String = "") -> AudioDeviceID {
+        if !pinnedUID.isEmpty, let pinned = deviceID(forUID: pinnedUID) { return pinned }
         let def = defaultInputID()
         guard preferBuiltIn, def != kAudioObjectUnknown, transportName(def) == "蓝牙",
               !isLidClosed(), let b = builtInMicID() else { return def }

@@ -13,12 +13,17 @@ final class HistoryPane: NSViewController {
         let firstMs: Double?
         let totalMs: Double?
         let polish: String?
+        let audio: String?
     }
 
     private static let maxRows = 1000
     private static let maxBytes: UInt64 = 2 * 1024 * 1024
 
     private let path: String
+    /// Folder holding saved WAV files (`<configDir>/audio`).
+    private let audioDir: String
+    /// Set by the app. Transcribes the WAV at the URL and calls back on the main queue (nil = failed).
+    var onRetranscribe: ((URL, @escaping (String?) -> Void) -> Void)?
     private let timeFmt: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -39,9 +44,16 @@ final class HistoryPane: NSViewController {
     private let metaLabel = NSTextField(labelWithString: "")
     private var copyResultButton = NSButton()
     private var copyRawButton = NSButton()
+    private var playButton = NSButton()
+    private var retranscribeButton = NSButton()
+    /// Strong ref so the sound keeps playing.
+    private var player: NSSound?
+    /// Row id whose re-transcription is running, nil when idle.
+    private var busyRowId: Int?
 
     init(configDir: String) {
         self.path = (configDir as NSString).appendingPathComponent("history.jsonl")
+        self.audioDir = (configDir as NSString).appendingPathComponent("audio")
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -153,8 +165,12 @@ final class HistoryPane: NSViewController {
         copyResultButton.isEnabled = false
         copyRawButton = modernButton("复制原文", symbol: "text.quote", prominent: false, action: #selector(copyRaw(_:)))
         copyRawButton.isEnabled = false
+        playButton = modernButton("播放录音", symbol: "play.fill", prominent: false, action: #selector(playAudio(_:)))
+        playButton.isEnabled = false
+        retranscribeButton = modernButton("重新识别", symbol: "arrow.clockwise", prominent: false, action: #selector(retranscribe(_:)))
+        retranscribeButton.isEnabled = false
 
-        let btnRow = NSStackView(views: [copyResultButton, copyRawButton])
+        let btnRow = NSStackView(views: [copyResultButton, copyRawButton, playButton, retranscribeButton])
         btnRow.orientation = .horizontal
         btnRow.spacing = 8
 
@@ -260,7 +276,8 @@ final class HistoryPane: NSViewController {
                 clean: (obj["clean"] as? String) ?? "",
                 firstMs: (obj["first_ms"] as? NSNumber)?.doubleValue,
                 totalMs: (obj["total_ms"] as? NSNumber)?.doubleValue,
-                polish: obj["polish"] as? String
+                polish: obj["polish"] as? String,
+                audio: obj["audio"] as? String
             ))
         }
         out.sort { $0.ts > $1.ts }
@@ -329,11 +346,16 @@ final class HistoryPane: NSViewController {
     }
 
     private func updateDetail() {
+        // Stop playback of the previous row when the detail changes.
+        player?.stop()
+        player = nil
+
         guard let r = selectedRow() else {
             setDetailText(clean: "在上方选一条记录查看详情", cleanColor: .secondaryLabelColor, raw: nil)
             metaLabel.stringValue = ""
             copyResultButton.isEnabled = false
             copyRawButton.isEnabled = false
+            updateAudioButtons()
             return
         }
         setDetailText(clean: r.clean, cleanColor: .labelColor, raw: "原文：" + r.raw)
@@ -345,6 +367,46 @@ final class HistoryPane: NSViewController {
 
         copyResultButton.isEnabled = true
         copyRawButton.isEnabled = true
+        updateAudioButtons()
+    }
+
+    /// Returns the WAV URL of a row, or nil when the row has no audio or the file was pruned.
+    private func audioURL(for r: Row?) -> URL? {
+        guard let name = r?.audio else { return nil }
+        let url = URL(fileURLWithPath: audioDir).appendingPathComponent(name)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    /// Sets enabled state and the re-transcribe title for the selected row.
+    private func updateAudioButtons() {
+        let hasAudio = audioURL(for: selectedRow()) != nil
+        playButton.isEnabled = hasAudio
+        let busy = busyRowId != nil && busyRowId == selectedRow()?.id
+        retranscribeButton.title = busy ? "识别中…" : "重新识别"
+        retranscribeButton.isEnabled = hasAudio && onRetranscribe != nil && busyRowId == nil
+    }
+
+    /// Shows the clean/raw text again, then a third paragraph with the re-transcription result.
+    private func showRetranscribeResult(_ r: Row, text: String?) {
+        setDetailText(clean: r.clean, cleanColor: .labelColor, raw: "原文：" + r.raw)
+        let para = NSMutableParagraphStyle()
+        para.lineBreakMode = .byWordWrapping
+        para.paragraphSpacingBefore = 8
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 14),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: para
+        ]
+        let out = NSMutableAttributedString(string: "\n", attributes: attrs)
+        if let text = text {
+            out.append(NSAttributedString(string: "重新识别：", attributes: attrs))
+            var textAttrs = attrs
+            textAttrs[.foregroundColor] = NSColor.labelColor
+            out.append(NSAttributedString(string: text, attributes: textAttrs))
+        } else {
+            out.append(NSAttributedString(string: "重新识别失败", attributes: attrs))
+        }
+        detailText.textStorage?.append(out)
     }
 
     private static func fmtSec(_ ms: Double) -> String {
@@ -380,6 +442,36 @@ final class HistoryPane: NSViewController {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
             button.title = title
             button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        }
+    }
+
+    /// Plays the row's WAV. Pressing again while playing stops it.
+    @objc private func playAudio(_ sender: Any?) {
+        if let p = player, p.isPlaying {
+            p.stop()
+            player = nil
+            return
+        }
+        guard let url = audioURL(for: selectedRow()),
+              let snd = NSSound(contentsOfFile: url.path, byReference: true) else { return }
+        player = snd
+        snd.play()
+    }
+
+    /// Re-transcribes the row's WAV through the app callback and shows the result in the detail view.
+    @objc private func retranscribe(_ sender: Any?) {
+        guard let r = selectedRow(), let url = audioURL(for: r),
+              let run = onRetranscribe, busyRowId == nil else { return }
+        let rowId = r.id
+        busyRowId = rowId
+        updateAudioButtons()
+        run(url) { [weak self] text in
+            guard let self = self else { return }
+            self.busyRowId = nil
+            self.updateAudioButtons()
+            // Ignore the result if the user selected another row meanwhile.
+            guard let cur = self.selectedRow(), cur.id == rowId else { return }
+            self.showRetranscribeResult(cur, text: text)
         }
     }
 

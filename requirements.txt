@@ -9,3 +9,4 @@ transformers==5.19.0   # required: mlx-audio imports it when loading speech mode
 sentencepiece==0.2.2
 pypinyin==0.55.0
 rapidfuzz==3.14.6
+sherpa-onnx==1.13.8   # live preview: streaming Paraformer on CPU

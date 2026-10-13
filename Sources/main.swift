@@ -5,81 +5,6 @@ import ServiceManagement
 
 // MARK: - HUD (small pill near the cursor)
 
-final class HUD {
-    private let panel: NSPanel
-    private let label = NSTextField(labelWithString: "")
-    private let bar = NSView()
-    private var hideWork: DispatchWorkItem?
-
-    init() {
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 260, height: 34),
-                        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
-        panel.level = .statusBar
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
-        panel.ignoresMouseEvents = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-
-        // Liquid Glass capsule on macOS 26+, dark HUD material before that
-        let frame = panel.contentView!.bounds
-        let host = NSView(frame: frame)
-        host.autoresizingMask = [.width, .height]
-        if #available(macOS 26.0, *) {
-            let glass = NSGlassEffectView(frame: frame)
-            glass.cornerRadius = frame.height / 2
-            glass.autoresizingMask = [.width, .height]
-            glass.contentView = host
-            panel.contentView?.addSubview(glass)
-            label.textColor = .labelColor
-        } else {
-            let bg = NSVisualEffectView(frame: frame)
-            bg.material = .hudWindow
-            bg.state = .active
-            bg.wantsLayer = true
-            bg.layer?.cornerRadius = frame.height / 2
-            bg.autoresizingMask = [.width, .height]
-            bg.addSubview(host)
-            panel.contentView?.addSubview(bg)
-            label.textColor = .white
-        }
-
-        label.font = .systemFont(ofSize: 13, weight: .medium)
-        label.lineBreakMode = .byTruncatingTail
-        label.frame = NSRect(x: 16, y: 8, width: 228, height: 18)
-        host.addSubview(label)
-
-        // level meter: brand violet, thin, rounded
-        bar.wantsLayer = true
-        bar.layer?.backgroundColor = NSColor(srgbRed: 0.56, green: 0.36, blue: 1.0, alpha: 1).cgColor
-        bar.layer?.cornerRadius = 1.5
-        bar.frame = NSRect(x: 16, y: 4, width: 0, height: 3)
-        host.addSubview(bar)
-    }
-
-    func show(_ text: String, at cgPoint: CGPoint? = nil, autoHide: TimeInterval? = nil) {
-        hideWork?.cancel()
-        label.stringValue = text
-        if let p = cgPoint {
-            // CG (top-left origin) -> Cocoa (bottom-left origin of the primary screen)
-            let h = NSScreen.screens.first?.frame.height ?? 0
-            panel.setFrameOrigin(NSPoint(x: p.x + 14, y: h - p.y - 50))
-        }
-        panel.orderFrontRegardless()
-        if let t = autoHide {
-            let w = DispatchWorkItem { [weak self] in self?.hide() }
-            hideWork = w
-            DispatchQueue.main.asyncAfter(deadline: .now() + t, execute: w)
-        }
-    }
-
-    func level(_ v: Float) { bar.frame.size.width = CGFloat(max(0, min(1, v))) * 228 }
-
-    func hide() {
-        level(0)
-        panel.orderOut(nil)
-    }
-}
 
 // MARK: - App
 
@@ -89,12 +14,14 @@ final class App: NSObject, NSApplicationDelegate {
         let target: TextTarget?
         let selection: String?     // non-nil: the user selected text before speaking => voice command on it
         var retried = false
+        var audio: String? = nil   // file name in audio/ (kept for replay / re-transcribe in 历史记录)
     }
 
     private var statusItem: NSStatusItem!
     private let hud = HUD()
     private let trigger = TrackpadTrigger()
     private let recorder = AudioRecorder()
+    private lazy var livePreview = LivePreview(base: cfg.asrURL)
     private var cfg = ZConfig.load()
     private lazy var window = MainWindowController(configDir: cfgDir)
     private var server: Process?
@@ -137,6 +64,10 @@ final class App: NSObject, NSApplicationDelegate {
             if !self.processing { self.hud.hide() }
         }
         recorder.onLevel = { [weak self] v in self?.hud.level(v) }
+        livePreview.onText = { [weak self] t in
+            guard let self, self.recorder.isRecording else { return }
+            self.hud.preview(t)
+        }
         recorder.onReady = { NSSound(named: "Tink")?.play() }
         tapOK = trigger.start()
         // headphones plugged in / mic switched: drop the warm engine so the next start rebuilds it
@@ -149,6 +80,7 @@ final class App: NSObject, NSApplicationDelegate {
         refreshStatus()
         window.show()
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refreshStatus() }
+        Commands.ensureFile()   // example file so users can see the format
         runLearner()   // catch up on anything dictated while the app was closed
         log("started")
     }
@@ -186,7 +118,12 @@ final class App: NSObject, NSApplicationDelegate {
         window.overview.setNetworkPlan(Cleaner.networkPlan(cfg: cfg), offline: cfg.offlineOnly)
         recorder.noiseMode = cfg.noiseMode
         recorder.preferBuiltIn = cfg.micPreferBuiltIn
+        recorder.pinnedMic = cfg.micDevice
+        window.settings.setMics(DeviceInfo.allInputs(), selected: cfg.micDevice)
+        window.settings.setPrompt(cfg.polishPrompt, builtIn: Cleaner.builtInPrompt)
+        window.settings.setHooks(filter: Hooks.hasFilter, after: Hooks.hasAfter)
         window.settings.setMicPreferBuiltIn(cfg.micPreferBuiltIn)
+        window.settings.setLivePreview(cfg.livePreview)
         window.settings.setSettings(hotkeyLabel: cfg.hotkeyLabel, forceClick: cfg.forceClick, noiseMode: cfg.noiseMode, polish: cfg.polish)
         window.settings.setExtra(twoPass: cfg.twoPass, launchAtLogin: SMAppService.mainApp.status == .enabled)
         window.overview.setLexicon(manual: cfg.dictionary.count, learnedTerms: cfg.learnedTerms.count,
@@ -209,6 +146,34 @@ final class App: NSObject, NSApplicationDelegate {
         }
         window.settings.onToggleForceClick = { [weak self] on in self?.cfg.forceClick = on; self?.cfg.save(); self?.applyConfig() }
         window.settings.onToggleNoiseMode = { [weak self] on in self?.cfg.noiseMode = on; self?.cfg.save(); self?.applyConfig() }
+        window.settings.onToggleLivePreview = { [weak self] on in
+            guard let self else { return }
+            self.cfg.livePreview = on
+            self.cfg.save()
+            self.applyConfig()
+            if on { self.livePreview.refreshStatus() }
+        }
+        window.settings.onChangeMic = { [weak self] uid in
+            guard let self else { return }
+            self.cfg.micDevice = uid
+            self.cfg.save()
+            self.applyConfig()
+            self.showMic(announce: true)
+        }
+        window.settings.onSavePrompt = { [weak self] text in
+            guard let self else { return }
+            self.cfg.polishPrompt = text
+            self.cfg.save()
+            self.hud.show(text.isEmpty ? "已恢复默认提示词" : "提示词已保存", autoHide: 1.2)
+        }
+        window.settings.onOpenCommands = {
+            Commands.ensureFile()
+            NSWorkspace.shared.open(Commands.fileURL)
+        }
+        window.settings.onOpenHooksFolder = {
+            try? FileManager.default.createDirectory(at: Hooks.dir, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(Hooks.dir)
+        }
         window.settings.onTogglePreferBuiltIn = { [weak self] on in
             guard let self else { return }
             self.cfg.micPreferBuiltIn = on
@@ -260,19 +225,29 @@ final class App: NSObject, NSApplicationDelegate {
             self.hud.show("云端模型已更新", autoHide: 1.2)
         }
         window.models.onModelActivated = { [weak self] in self?.refreshStatus() }
+        // 历史记录 → 重新识别: run a saved take through the current model again (no polish, nothing typed)
+        window.history.onRetranscribe = { [weak self] url, done in
+            guard let self, let wav = try? Data(contentsOf: url) else { done(nil); return }
+            ASRClient.transcribe(wav: wav, hotwords: self.cfg.allTerms, cfg: self.cfg) { r in
+                DispatchQueue.main.async { done((try? r.get())?.text) }
+            }
+        }
         DeviceInfo.observe { [weak self] _ in
             guard let self else { return }
             self.showMic(announce: self.micShown != nil)   // the first report at launch is not announced
+            self.window.settings.setMics(DeviceInfo.allInputs(), selected: self.cfg.micDevice)
         }
     }
 
+    private var hooksShown: [Bool] = []
+    private var commandsShown = -1
     private var micShown: String?   // "default>recording" device pair last shown; a change is announced
 
     /// Shows the device the next take will record from (may differ from the system default: Bluetooth → built-in).
     /// With `announce`, a real switch is also shown next to the mouse.
     private func showMic(announce: Bool) {
         let def = DeviceInfo.currentInput()
-        let rec = DeviceInfo.info(DeviceInfo.recordingInput(preferBuiltIn: cfg.micPreferBuiltIn))
+        let rec = DeviceInfo.info(DeviceInfo.recordingInput(preferBuiltIn: cfg.micPreferBuiltIn, pinnedUID: cfg.micDevice))
         let name = rec?.name ?? "未检测到麦克风"
         window.overview.setMic(name: name, symbol: rec?.symbol ?? "mic.slash", builtIn: rec?.isBuiltIn ?? false)
         let key = "\(def?.id ?? 0)>\(rec?.id ?? 0)"
@@ -310,6 +285,14 @@ final class App: NSObject, NSApplicationDelegate {
 
     private func refreshStatus() {
         showMic(announce: true)   // the lid can close/open without a device-change event
+        if cfg.livePreview, !livePreview.available { livePreview.refreshStatus() }
+        let hooks = [Hooks.hasFilter, Hooks.hasAfter]
+        if hooks != hooksShown || Commands.count != commandsShown {   // only on change: these rebuild settings controls
+            hooksShown = hooks
+            commandsShown = Commands.count
+            window.settings.setHooks(filter: hooks[0], after: hooks[1])
+            window.settings.setCommands(count: commandsShown)
+        }
         refreshStats()
         if !tapOK && AXIsProcessTrusted() { tapOK = trigger.start() }
         // Secure Keyboard Entry (password fields, some terminals) silently blinds every event tap
@@ -331,21 +314,25 @@ final class App: NSObject, NSApplicationDelegate {
         if IsSecureEventInputEnabled() { hud.show("安全输入已开启，无法录音", at: p, autoHide: 2); return }
         target = AXTarget.editableElement(at: p) ?? AXTarget.focusedTarget()
         selection = target.flatMap { AXTarget.selectedText(of: $0) }
+        Cleaner.prewarm(cfg: cfg)   // TLS to the polish LLM is ready by the time the user stops talking
         do {
             try recorder.start()
             let what = selection != nil ? "说出修改指令…（改写选中文字）" : "听着… " + (target.map { "→ \($0.appName)" } ?? "→ 当前焦点")
             hud.show(processing ? "听着…（上一句还在处理）" : what, at: p)
+            if cfg.livePreview, selection == nil { livePreview.start(recorder) }
         } catch {
             hud.show("录音失败：\(error.localizedDescription)", at: p, autoHide: 3)
         }
     }
 
     private func cancel() {
+        livePreview.stop()
         _ = recorder.stop()
         hud.show("已取消", autoHide: 0.8)
     }
 
     private func end() {
+        livePreview.stop()
         let tgt = target, sel = selection
         recorder.stop(postRoll: 0.25) { [weak self] wav in   // keep listening a moment so the last word isn't clipped
             guard let self else { return }
@@ -355,7 +342,7 @@ final class App: NSObject, NSApplicationDelegate {
                 if !self.processing { self.hud.show("没收到声音：麦克风已重置，请再说一次", autoHide: 2.5) }
                 return
             }
-            self.jobs.append(Job(wav: wav, target: tgt, selection: sel))
+            self.jobs.append(Job(wav: wav, target: tgt, selection: sel, audio: self.saveAudio(wav)))
             self.processNext()
         }
     }
@@ -387,6 +374,14 @@ final class App: NSObject, NSApplicationDelegate {
                     self.finishJob(message: "没听清", hold: 1)
                     return
                 }
+                // a spoken command (commands.txt): the whole utterance is the trigger; nothing is typed
+                if job.selection == nil, let cmd = Commands.match(asr.text) ?? Commands.match(asr.raw) {
+                    let ok = Commands.run(cmd, appName: job.target?.appName ?? "", bundleID: job.target?.bundleID ?? "")
+                    self.record(raw: asr.raw, clean: "", app: job.target?.appName ?? "", asrMs: asrMs, totalMs: asrMs, firstMs: asrMs,
+                                swap: "command:\(cmd.phrase)" + (ok ? "" : ":failed"), audio: job.audio)
+                    self.finishJob(message: ok ? "⌘ \(cmd.phrase)" : "口令没执行成功：\(cmd.action)", hold: ok ? 1.0 : 3)
+                    return
+                }
                 let (sendText, send) = self.cfg.autoSend ? Cleaner.extractSend(asr.text) : (asr.text, false)
                 if let sel = job.selection, let t = job.target {
                     self.runCommand(asr.text, on: sel, in: t, t0: t0)
@@ -407,7 +402,8 @@ final class App: NSObject, NSApplicationDelegate {
     /// Pass 1: local rules + pinyin-dictionary fixes go on screen immediately.
     /// Pass 2: LLM refines in the background and swaps the text in place — only if the user hasn't touched it since.
     private func twoPass(_ asr: ASRResult, job: Job, t0: Date, asrMs: Int) {
-        let fast = Cleaner.rules(asr.text, cfg: cfg)
+        let env = hookEnv(job, raw: asr.raw)
+        let fast = Hooks.filter(Cleaner.rules(asr.text, cfg: cfg), env: env)
         guard let out = deliver(fast, to: job.target) else {
             finishJob(message: "没找到输入框，已复制到剪贴板（⌘V 粘贴）", hold: 3)
             return
@@ -429,8 +425,9 @@ final class App: NSObject, NSApplicationDelegate {
             : (tgt?.contextBefore ?? "")
         recent.append((Date(), appName, fast))
         Cleaner.refine(fast, appName: appName, contextBefore: ctx, similar: asr.similar,
-                       singleLine: terminal, style: cfg.style(for: tgt?.bundleID ?? ""), cfg: cfg) { [weak self] better in
+                       singleLine: terminal, style: cfg.style(for: tgt?.bundleID ?? ""), cfg: cfg) { [weak self] polished in
             guard let self else { return }
+            let better = polished.map { Hooks.filter($0, env: env) }.flatMap { $0 == fast ? nil : $0 }
             var final = fast
             var swap = better == nil ? "unchanged:\(Cleaner.lastRefineNote)" : "no-target"
             if let better, let t = out { swap = self.swapIn(fast, better, in: t, caret: caret, seq: mySeq, since: insertedAt) }
@@ -442,7 +439,7 @@ final class App: NSObject, NSApplicationDelegate {
             }
             let totalMs = Int(Date().timeIntervalSince(t0) * 1000)
             self.record(raw: asr.raw, clean: final, app: tgt?.appName ?? "", asrMs: asrMs, totalMs: totalMs, firstMs: firstMs,
-                        swap: swap, refined: better)
+                        swap: swap, refined: better, audio: job.audio)
             if let t = out, !terminal { self.watchEdits(of: final, in: t) }
             self.noteDictation()
         }
@@ -470,14 +467,24 @@ final class App: NSObject, NSApplicationDelegate {
         let finish: (String, String) -> Void = { [weak self] text, how in
             guard let self, !done else { return }
             done = true
+            let text = Hooks.filter(text, env: self.hookEnv(job, raw: asr.raw))
             let out = self.deliver(text, to: job.target)
             if sendAfter, out != nil { self.pressReturn(after: 0.15) }
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
             self.recent.append((Date(), appName, text))
             self.window.overview.setLast(raw: asr.raw, clean: text, ms: ms)
-            self.record(raw: asr.raw, clean: text, app: appName, asrMs: asrMs, totalMs: ms, firstMs: ms, swap: sendAfter ? how + "+send" : how)
+            self.record(raw: asr.raw, clean: text, app: appName, asrMs: asrMs, totalMs: ms, firstMs: ms, swap: sendAfter ? how + "+send" : how, audio: job.audio)
             self.finishJob(message: out != nil ? "✓ \(text)" : "没找到输入框，已复制到剪贴板（⌘V 粘贴）", hold: 1.0)
             self.noteDictation()
+        }
+        // Short and clean: polish changed the words of none of 16 such sentences (history, 10-12/13), so don't wait.
+        // The polish still runs in the background, logged as tag "quick" in polish.jsonl: note "ok" there means
+        // skipping lost a real fix, and the rule should be tightened.
+        if cfg.polish == "auto", Self.quickEnough(fast, asr) {
+            finish(fast, "terminal:quick")
+            Cleaner.refine(fast, appName: appName, contextBefore: ctx, similar: asr.similar, singleLine: true,
+                           style: cfg.style(for: job.target?.bundleID ?? ""), tag: "quick", cfg: cfg) { _ in }
+            return
         }
         if cfg.polish != "fast" { hud.show("整理中…") }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { finish(fast, "terminal:deadline") }
@@ -495,7 +502,7 @@ final class App: NSObject, NSApplicationDelegate {
             let out = self.deliver(text, to: job.target)
             let totalMs = Int(Date().timeIntervalSince(t0) * 1000)
             self.window.overview.setLast(raw: asr.raw, clean: text, ms: totalMs)
-            self.record(raw: asr.raw, clean: text, app: job.target?.appName ?? "", asrMs: asrMs, totalMs: totalMs, firstMs: totalMs)
+            self.record(raw: asr.raw, clean: text, app: job.target?.appName ?? "", asrMs: asrMs, totalMs: totalMs, firstMs: totalMs, audio: job.audio)
             if let t = out ?? nil, !AXTarget.isTerminal(t) { self.watchEdits(of: text, in: t) }
             self.finishJob(message: out != nil ? "✓ \(text)" : "没找到输入框，已复制到剪贴板（⌘V 粘贴）", hold: out != nil ? 1.2 : 3)
             self.noteDictation()
@@ -566,6 +573,34 @@ final class App: NSObject, NSApplicationDelegate {
             let name = url.map { FileManager.default.displayName(atPath: $0.path).replacingOccurrences(of: ".app", with: "") } ?? id
             return (id, name, cfg.style(for: id), cfg.appStyles[id] == nil)
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    /// A sentence the polish almost never improves: under 20 characters, no filler sound, no near-sound dictionary candidate.
+    private static func quickEnough(_ text: String, _ asr: ASRResult) -> Bool {
+        text.count < 20 && asr.similar.isEmpty
+            && asr.raw.range(of: "[呃嗯额]", options: .regularExpression) == nil
+    }
+
+    /// Environment for plug-in scripts (see Hooks.swift).
+    private func hookEnv(_ job: Job, raw: String) -> [String: String] {
+        ["ZHIYU_APP": job.target?.appName ?? "", "ZHIYU_BUNDLE": job.target?.bundleID ?? "", "ZHIYU_RAW": raw,
+         "ZHIYU_MIC": DeviceInfo.info(recorder.activeDevice)?.name ?? ""]
+    }
+
+    private static let audioKeep = 200   // newest takes kept on disk (~5 s each ≈ 160 KB → ~32 MB)
+
+    /// Saves a take to audio/ for replay and re-transcription, then prunes all but the newest `audioKeep`. Returns the file name.
+    private func saveAudio(_ wav: Data) -> String? {
+        let dir = cfgDir + "/audio"
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let name = "\(Int(Date().timeIntervalSince1970 * 1000)).wav"
+        guard fm.createFile(atPath: dir + "/" + name, contents: wav) else { return nil }
+        DispatchQueue.global(qos: .utility).async {
+            let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasSuffix(".wav") }.sorted()
+            for f in files.dropLast(Self.audioKeep) { try? fm.removeItem(atPath: dir + "/" + f) }
+        }
+        return name
     }
 
     private func saveFailed(_ wav: Data) -> String {
@@ -642,7 +677,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     // MARK: ASR server
 
-    static let serverVersion = 3
+    static let serverVersion = 5
 
     /// An ASR server left over from an older app build keeps answering /health but lacks new endpoints:
     /// if its version is older than ours, stop it so startServerIfNeeded() spawns the current one.
@@ -714,11 +749,13 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     private func record(raw: String, clean: String, app: String, asrMs: Int, totalMs: Int, firstMs: Int,
-                        swap: String? = nil, refined: String? = nil) {
+                        swap: String? = nil, refined: String? = nil, audio: String? = nil) {
         var row: [String: Any] = ["ts": ISO8601DateFormatter().string(from: Date()), "app": app, "raw": raw, "clean": clean,
                                   "polish": cfg.polish, "two_pass": cfg.twoPass, "asr_ms": asrMs, "first_ms": firstMs,
                                   "total_ms": totalMs]
         if let mic = DeviceInfo.info(recorder.activeDevice)?.name { row["mic"] = mic }
+        if let audio { row["audio"] = audio }
+        Hooks.after(clean, env: ["ZHIYU_APP": app, "ZHIYU_RAW": raw, "ZHIYU_MIC": (row["mic"] as? String) ?? ""])
         if let swap { row["swap"] = swap }
         if let refined, refined != clean { row["refined_unapplied"] = refined }   // second pass had a fix but couldn't apply it
         appendJSONL(row, to: "history.jsonl")

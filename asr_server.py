@@ -14,9 +14,10 @@ import threading
 import time
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
-from huggingface_hub import try_to_load_from_cache
+from huggingface_hub import hf_hub_download, try_to_load_from_cache
 from huggingface_hub.constants import HF_HUB_CACHE
 from mlx_audio.stt.utils import load_model
 
@@ -32,7 +33,11 @@ LLM_CHECK_S = 30.0
 MODELS_FILE = os.path.join(os.path.expanduser("~"), ".config", "zhiyu", "models.json")
 MIRROR_ENDPOINT = "https://hf-mirror.com"
 DOWNLOAD_FAIL_MSG = "下载失败（网络或磁盘），可重试或换镜像"
-SERVER_VERSION = 3
+SERVER_VERSION = 5
+STREAM_REPO = "csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en"
+STREAM_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt")
+STREAM_IDLE_S = 60.0
+STREAM_TAIL_S = 0.66
 
 CATALOG = [
     # speech recognition — every entry below loads and transcribes with the bundled mlx-audio (M1, 2026-10-12)
@@ -109,6 +114,11 @@ _download_errors: dict[str, str] = {}
 _auto_activate: dict[str, bool] = {}
 _watcher_running = False
 _gen_cache: tuple | None = None  # (id of loaded ASR model, accepted generate() kw names, has **kwargs)
+# live preview (sherpa-onnx streaming Paraformer, CPU); guarded by _stream_lock only, never by _lock
+_stream_rec = None
+_streams: dict[str, tuple] = {}  # session id -> (stream, last used time.monotonic())
+_stream_lock = threading.Lock()
+_stream_downloading = False
 
 
 def decode_wav(data: bytes) -> np.ndarray:
@@ -724,6 +734,126 @@ def api_remove(body: dict) -> dict:
     return {"ok": True}
 
 
+def _stream_paths(local_only: bool) -> dict[str, str] | None:
+    try:
+        return {f: hf_hub_download(repo_id=STREAM_REPO, filename=f, local_files_only=local_only)
+                for f in STREAM_FILES}
+    except Exception:
+        return None
+
+
+def _stream_available() -> bool:
+    try:
+        import sherpa_onnx  # noqa: F401
+    except Exception:
+        return False
+    return _stream_paths(local_only=True) is not None
+
+
+def stream_status() -> dict:
+    ok = _stream_available()
+    if ok and _stream_rec is None:
+        # warm up in the background: the first load costs ~0.8 s and must not land on the first dictation
+        def warm():
+            with _stream_lock:
+                _load_stream_rec()
+        threading.Thread(target=warm, daemon=True).start()
+    return {"available": ok, "downloading": _stream_downloading}
+
+
+def _stream_download_run() -> None:
+    global _stream_downloading
+    try:
+        # subprocess: this server runs with HF_HUB_OFFLINE=1 (same reason as start_download)
+        env = dict(os.environ, HF_HUB_OFFLINE="0", HF_HUB_DISABLE_XET="1")
+        code = ("from huggingface_hub import hf_hub_download as d\n"
+                f"for f in {list(STREAM_FILES)!r}: d({STREAM_REPO!r}, f)")
+        r = subprocess.run([sys.executable, "-I", "-c", code], env=env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.decode("utf-8", "replace")[-300:])
+        print("preview model downloaded", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"preview download failed: {e}", file=sys.stderr, flush=True)
+    finally:
+        _stream_downloading = False
+
+
+def api_stream_download(body: dict) -> dict:
+    global _stream_downloading
+    if _stream_available():
+        return {"ok": True}
+    with _dl_lock:
+        if _stream_downloading:
+            return {"ok": True}
+        _stream_downloading = True
+    threading.Thread(target=_stream_download_run, daemon=True).start()
+    return {"ok": True}
+
+
+def _load_stream_rec():
+    # Caller must hold _stream_lock. Returns None when the preview recognizer is unavailable.
+    global _stream_rec
+    if _stream_rec is not None:
+        return _stream_rec
+    try:
+        import sherpa_onnx
+        paths = _stream_paths(local_only=True)
+        if paths is None:
+            return None
+        t0 = time.perf_counter()
+        _stream_rec = sherpa_onnx.OnlineRecognizer.from_paraformer(
+            tokens=paths["tokens.txt"], encoder=paths["encoder.int8.onnx"], decoder=paths["decoder.int8.onnx"],
+            num_threads=2, provider="cpu", sample_rate=TARGET_SR, feature_dim=80, decoding_method="greedy_search")
+        print(f"preview loaded in {int((time.perf_counter() - t0) * 1000)} ms", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"preview disabled: {e}", file=sys.stderr, flush=True)
+        return None
+    return _stream_rec
+
+
+def _stream_decode(rec, s) -> str:
+    while rec.is_ready(s):
+        rec.decode_stream(s)
+    return str(rec.get_result(s))
+
+
+def _prune_streams(now: float) -> None:
+    # Caller must hold _stream_lock.
+    for sid in [k for k, (_, used) in _streams.items() if now - used > STREAM_IDLE_S]:
+        del _streams[sid]
+
+
+def stream_feed(sid: str, body: bytes) -> tuple[int, dict]:
+    with _stream_lock:
+        now = time.monotonic()
+        _prune_streams(now)
+        rec = _load_stream_rec()
+        if rec is None:
+            return 409, {"error": "unavailable"}
+        entry = _streams.get(sid)
+        s = entry[0] if entry else rec.create_stream()
+        samples = np.frombuffer(body, dtype="<f4").astype(np.float32)
+        if samples.size:
+            s.accept_waveform(TARGET_SR, samples)
+        text = _stream_decode(rec, s)
+        _streams[sid] = (s, now)
+        return 200, {"text": text}
+
+
+def stream_end(sid: str) -> dict:
+    with _stream_lock:
+        now = time.monotonic()
+        entry = _streams.pop(sid, None)
+        _prune_streams(now)
+        if entry is None or _stream_rec is None:
+            return {"text": ""}
+        s = entry[0]
+        s.accept_waveform(TARGET_SR, np.zeros(int(STREAM_TAIL_S * TARGET_SR), dtype=np.float32))
+        s.input_finished()
+        return {"text": _stream_decode(_stream_rec, s)}
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, obj: dict) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -737,30 +867,40 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(int(self.headers.get("Content-Length", "0")))
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        path = urlparse(self.path).path
+        if path == "/health":
             self._send(200, {"ok": True, "version": SERVER_VERSION, "model": MODEL, "asr_model": MODEL, "llm_model": LLM_MODEL})
-        elif self.path == "/models":
+        elif path == "/models":
             self._send(200, {"items": list_models()})
-        elif self.path == "/models/format":
+        elif path == "/models/format":
             self._send(200, {"text": FORMAT_GUIDE})
+        elif path == "/stream/status":
+            self._send(200, stream_status())
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        if self.path == "/transcribe":
+        path = urlparse(self.path).path
+        if path == "/transcribe":
             self._transcribe()
-        elif self.path == "/clean":
+        elif path == "/clean":
             self._clean()
-        elif self.path == "/command":
+        elif path == "/command":
             self._command()
-        elif self.path == "/models/download":
+        elif path == "/models/download":
             self._run_json(api_download)
-        elif self.path == "/models/activate":
+        elif path == "/models/activate":
             self._run_json(api_activate)
-        elif self.path == "/models/import":
+        elif path == "/models/import":
             self._run_json(api_import)
-        elif self.path == "/models/remove":
+        elif path == "/models/remove":
             self._run_json(api_remove)
+        elif path == "/stream/download":
+            self._run_json(api_stream_download)
+        elif path == "/stream/feed":
+            self._stream_feed()
+        elif path == "/stream/end":
+            self._stream_end()
         else:
             self._send(404, {"error": "not found"})
 
@@ -839,6 +979,29 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"text": out, "ms": int((time.perf_counter() - t0) * 1000)})
         except LLMUnavailable as e:
             self._send(503, {"error": str(e)})
+        except Exception as e:
+            self._send(500, {"error": str(e)})
+
+    def _stream_id(self) -> str:
+        sid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+        if not sid:
+            raise BadRequest("missing id")
+        return sid
+
+    def _stream_feed(self) -> None:
+        try:
+            code, obj = stream_feed(self._stream_id(), self._read_body())
+            self._send(code, obj)
+        except BadRequest as e:
+            self._send(400, {"error": str(e)})
+        except Exception as e:
+            self._send(500, {"error": str(e)})
+
+    def _stream_end(self) -> None:
+        try:
+            self._send(200, stream_end(self._stream_id()))
+        except BadRequest as e:
+            self._send(400, {"error": str(e)})
         except Exception as e:
             self._send(500, {"error": str(e)})
 
