@@ -33,7 +33,7 @@ LLM_CHECK_S = 30.0
 MODELS_FILE = os.path.join(os.path.expanduser("~"), ".config", "zhiyu", "models.json")
 MIRROR_ENDPOINT = "https://hf-mirror.com"
 DOWNLOAD_FAIL_MSG = "下载失败（网络或磁盘），可重试或换镜像"
-SERVER_VERSION = 6
+SERVER_VERSION = 7
 STREAM_REPO = "csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en"
 STREAM_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt")
 STREAM_IDLE_S = 60.0
@@ -197,9 +197,19 @@ def parse_corrections(raw) -> list[tuple[str, str]]:
     return out
 
 
+def replace_word(text: str, wrong: str, right: str) -> str:
+    """Replace `wrong`, but never inside a Latin word: Cloud→Claude must leave iCloud alone."""
+    pat = re.escape(wrong)
+    if re.match(r"[A-Za-z0-9]", wrong[0]):
+        pat = r"(?<![A-Za-z0-9])" + pat
+    if re.match(r"[A-Za-z0-9]", wrong[-1]):
+        pat += r"(?![A-Za-z0-9])"
+    return re.sub(pat, lambda _: right, text)
+
+
 def rules_clean(text: str, corrections: list[tuple[str, str]]) -> str:
     for wrong, right in sorted(corrections, key=lambda c: len(c[0]), reverse=True):
-        text = text.replace(wrong, right)
+        text = replace_word(text, wrong, right)
     text = FILLER_RE.sub("", text)
     text = EN_FILLER_RE.sub("", text)
     text = collapse_repeats(text)

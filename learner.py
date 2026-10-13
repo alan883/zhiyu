@@ -594,6 +594,13 @@ def replace_pairs(inserted, final, known=(), corpus=""):
         s = 0
         while s < m - p and wraw[-1 - s] == rraw[-1 - s]:
             s += 1
+        # never cut inside a Latin word: Cloud→Claude must not become oud→aude
+        def alnum(t, k):
+            return 0 <= k < len(t) and re.match(r"[A-Za-z0-9]", t[k]) is not None
+        while p > 0 and alnum(wraw, p - 1) and (alnum(wraw, p) or alnum(rraw, p)):
+            p -= 1
+        while s > 0 and alnum(wraw, len(wraw) - s) and (alnum(wraw, len(wraw) - s - 1) or alnum(rraw, len(rraw) - s - 1)):
+            s -= 1
         cws, cwe, crs, cre = ws + p, we - s, rs + p, re_ - s
         wc, rc = inserted[cws:cwe], final[crs:cre]
         pair = _term_pair(inserted, final, sa, sb, ops, known, cws, cwe, crs, cre)

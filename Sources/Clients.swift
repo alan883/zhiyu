@@ -821,12 +821,23 @@ enum Cleaner {
         }.resume()
     }
 
+    /// Replaces `wrong`, but never inside a Latin word: Cloud→Claude must leave iCloud alone.
+    static func replaceWord(_ s: String, _ wrong: String, _ right: String) -> String {
+        let isAlnum: (Character?) -> Bool = { $0.map { $0.isASCII && ($0.isLetter || $0.isNumber) } ?? false }
+        var pat = NSRegularExpression.escapedPattern(for: wrong)
+        if isAlnum(wrong.first) { pat = "(?<![A-Za-z0-9])" + pat }
+        if isAlnum(wrong.last) { pat += "(?![A-Za-z0-9])" }
+        guard let re = try? NSRegularExpression(pattern: pat) else { return s }
+        return re.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s),
+                                           withTemplate: NSRegularExpression.escapedTemplate(for: right))
+    }
+
     /// Deterministic local fallback: corrections, filler removal, stutter collapse.
     static func rules(_ s: String, cfg: ZConfig) -> String {
         var out = cfg.corrections
             .filter { !$0.wrong.isEmpty }
             .sorted { $0.wrong.count > $1.wrong.count }
-            .reduce(s) { $0.replacingOccurrences(of: $1.wrong, with: $1.right) }
+            .reduce(s) { replaceWord($0, $1.wrong, $1.right) }
         let steps: [(pattern: String, template: String)] = [
             ("(?i)\\b(?:umm?|uhh?m?|erm|hmm)\\b[,，]?[ \\t]*", ""),
             ("(^|[，。！？、 ])(?:(?:呃|嗯|额|唔|(?i:emm))[，、]?)+", "$1"),
