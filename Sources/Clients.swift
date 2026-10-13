@@ -663,7 +663,8 @@ enum Cleaner {
         let started = Date()
         let completion: (String?) -> Void = { r in
             logPolish(ms: Int(Date().timeIntervalSince(started) * 1000), note: r == nil ? lastRefineNote : "ok",
-                      mode: cfg.polish == "local" || cfg.offlineOnly ? "local" : "cloud", chars: input.count, tag: tag)
+                      mode: cfg.polish == "local" || cfg.offlineOnly ? "local" : "cloud", chars: input.count, tag: tag,
+                      change: r.map { (input, $0) })
             done(r)
         }
         // lastRefineNote explains every nil, so the history log can tell "nothing to fix" from "timed out" or "blocked"
@@ -707,9 +708,11 @@ enum Cleaner {
     }
 
     /// Appends one line to polish.jsonl: how long a polish took and how it ended. Main queue only.
-    private static func logPolish(ms: Int, note: String, mode: String, chars: Int, tag: String) {
+    /// `change` keeps the before/after text of an accepted polish, so fixes that missed the deadline can be judged later.
+    private static func logPolish(ms: Int, note: String, mode: String, chars: Int, tag: String, change: (String, String)? = nil) {
         var row: [String: Any] = ["ts": ISO8601DateFormatter().string(from: Date()), "ms": ms, "note": note, "mode": mode, "chars": chars]
         if !tag.isEmpty { row["tag"] = tag }
+        if let (from, to) = change { row["in"] = from; row["out"] = to }
         guard let data = try? JSONSerialization.data(withJSONObject: row) else { return }
         let url = ZConfig.configDir.appendingPathComponent("polish.jsonl")
         if let fh = try? FileHandle(forWritingTo: url) {
