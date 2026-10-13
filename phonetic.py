@@ -194,6 +194,11 @@ class PhoneticCorrector:
                 for i in range(len(toks) - k + 1):
                     s = toks[i][0]
                     e = toks[i + k - 1][1]
+                    # a multi-word window may only bridge spaces ("deep seek"), never other text:
+                    # "A一百S的这个实际项目。我还需要你跟那个DeepSeek" once became "A一百DeepSeek" (10-13)
+                    if any(text[toks[j][1]:toks[j + 1][0]].strip(" ") or toks[j + 1][0] - toks[j][1] > 1
+                           for j in range(i, i + k - 1)):
+                        continue
                     surface = text[s:e]
                     if surface == term or surface in self._terms:
                         continue
