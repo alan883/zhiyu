@@ -6,6 +6,7 @@ final class SettingsPane: NSViewController {
     var onChangeHotkey: ((@escaping (String?) -> Void) -> Void)?
     var onToggleForceClick: ((Bool) -> Void)?
     var onToggleNoiseMode: ((Bool) -> Void)?
+    var onTogglePreferBuiltIn: ((Bool) -> Void)?
     var onChangePolish: ((String) -> Void)?      // "fast" | "auto" | "local"
     var onToggleTwoPass: ((Bool) -> Void)?
     var onToggleLaunchAtLogin: ((Bool) -> Void)?
@@ -19,6 +20,7 @@ final class SettingsPane: NSViewController {
     private var hotkeyLabel = "右 Option"
     private var forceClick = false
     private var noiseMode = false
+    private var preferBuiltIn = true
     private var polish = "fast"
     private var twoPass = false
     private var launchAtLogin = false
@@ -45,6 +47,7 @@ final class SettingsPane: NSViewController {
     private var hotkeyButton: NSButton?
     private var forceSwitch: NSSwitch?
     private var noiseSwitch: NSSwitch?
+    private var preferBuiltInSwitch: NSSwitch?
     private var polishControl: NSSegmentedControl?
     private var polishHint: NSTextField?
     private var twoPassSwitch: NSSwitch?
@@ -135,6 +138,12 @@ final class SettingsPane: NSViewController {
         applyState()
     }
 
+    /// Mic preference: use the Mac built-in mic when Bluetooth headphones are connected. Stored until the view loads.
+    func setMicPreferBuiltIn(_ on: Bool) {
+        preferBuiltIn = on
+        applyState()
+    }
+
     /// Feature toggles owned by the core app. Stored until the view loads.
     func setFeatures(handsFree: Bool, autoSend: Bool, offline: Bool) {
         self.handsFree = handsFree
@@ -155,6 +164,7 @@ final class SettingsPane: NSViewController {
         keycapLabel?.stringValue = hotkeyLabel
         forceSwitch?.state = forceClick ? .on : .off
         noiseSwitch?.state = noiseMode ? .on : .off
+        preferBuiltInSwitch?.state = preferBuiltIn ? .on : .off
         polishControl?.selectedSegment = Self.polishValues.firstIndex(of: polish) ?? 0
         polishHint?.stringValue = Self.polishHints[polish] ?? ""
         twoPassSwitch?.state = twoPass ? .on : .off
@@ -220,6 +230,12 @@ final class SettingsPane: NSViewController {
         let twoPassRow = row(symbol: "text.cursor", color: .systemGreen, title: "先上屏，再自动纠错",
                              subtitle: "像豆包：1–3 秒后原地替换为润色版", control: twoPassSw, textWidth: 480)
 
+        let preferSw = makeSwitch(#selector(preferBuiltInChanged(_:)))
+        preferBuiltInSwitch = preferSw
+        let preferRow = row(symbol: "airpodspro", color: .systemTeal, title: "戴蓝牙耳机时用 Mac 麦克风",
+                            subtitle: "耳机只放声音，不切换通话 / 降噪模式，开口快约 0.5 秒。合上屏幕时自动改用耳机麦克风。",
+                            control: preferSw, textWidth: 480)
+
         let noiseSw = makeSwitch(#selector(noiseModeChanged(_:)))
         noiseSwitch = noiseSw
         let noiseRow = row(symbol: "waveform.badge.mic", color: .systemOrange, title: "嘈杂环境模式",
@@ -232,7 +248,7 @@ final class SettingsPane: NSViewController {
                               subtitle: "句尾单独说“发送 / 回车 / 发出去”时，上屏后自动按回车",
                               control: autoSendSw, textWidth: 480)
 
-        return card([polishRow, twoPassRow, noiseRow, autoSendRow])
+        return card([polishRow, twoPassRow, preferRow, noiseRow, autoSendRow])
     }
 
     private func appStyleCard() -> NSView {
@@ -597,6 +613,11 @@ final class SettingsPane: NSViewController {
     @objc private func noiseModeChanged(_ sender: NSSwitch) {
         noiseMode = sender.state == .on
         onToggleNoiseMode?(noiseMode)
+    }
+
+    @objc private func preferBuiltInChanged(_ sender: NSSwitch) {
+        preferBuiltIn = sender.state == .on
+        onTogglePreferBuiltIn?(preferBuiltIn)
     }
 
     @objc private func polishChanged(_ sender: NSSegmentedControl) {

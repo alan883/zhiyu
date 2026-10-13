@@ -17,6 +17,7 @@ struct ZConfig {
     var hotkeyLabel = "右 Option"
     var forceClick = true
     var noiseMode = false   // built-in mic voice processing is flaky on M1 Air (measured); opt-in only
+    var micPreferBuiltIn = true   // Bluetooth headset as default input: record from the built-in mic (no call-mode switch, ~0.5 s faster, measured)
     var twoPass = true
     var launchAtLogin = false
     var dictionary: [String] = []
@@ -98,6 +99,7 @@ struct ZConfig {
             }
             if let b = j["force_click"] as? Bool { c.forceClick = b }
             if let b = j["noise_mode"] as? Bool { c.noiseMode = b }
+            if let b = j["mic_prefer_builtin"] as? Bool { c.micPreferBuiltIn = b }
             if let b = j["two_pass"] as? Bool { c.twoPass = b }
             if let b = j["launch_at_login"] as? Bool { c.launchAtLogin = b }
             if let b = j["offline_only"] as? Bool { c.offlineOnly = b }
@@ -144,6 +146,7 @@ struct ZConfig {
         j["hotkey"] = ["keycode": NSNumber(value: hotkeyCode), "modifier": hotkeyModifier, "label": hotkeyLabel] as [String: Any]
         j["force_click"] = forceClick
         j["noise_mode"] = noiseMode
+        j["mic_prefer_builtin"] = micPreferBuiltIn
         j["two_pass"] = twoPass
         j["launch_at_login"] = launchAtLogin
         j["offline_only"] = offlineOnly

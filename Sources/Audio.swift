@@ -6,10 +6,12 @@ import Foundation
 final class AudioRecorder {
     /// Normalized 0...1 RMS level, delivered on the main queue at ~20 Hz.
     var onLevel: ((Float) -> Void)?
-    /// Called once on the main queue when the first converted buffer of a recording arrives.
+    /// Called once on the main queue when the first non-silent converted buffer of a recording arrives.
     var onReady: (() -> Void)?
     /// Apple voice processing (noise suppression / AGC, shows as "Voice Isolation" in Control Center).
     var noiseMode = true
+    /// Record from the built-in mic when the default input is a Bluetooth headset.
+    var preferBuiltIn = true
     /// True when the engine in use runs with voice processing (may be false even if noiseMode is on).
     private(set) var voiceProcessingActive = false
     /// Input devices where voice processing produced no audio or stopped the engine. Plain capture is used for them.
@@ -26,9 +28,15 @@ final class AudioRecorder {
     private let lock = NSLock()
     private var engine: AVAudioEngine?         // non-nil while the tap is installed (recording or warm)
     private var builtVP = false                // whether the current engine runs with voice processing
-    private var builtDevice: AudioDeviceID = 0  // default input device the current engine was built for
+    private var builtDevice: AudioDeviceID = 0  // input device the current capture was built for
     private var tapBuffers = 0                 // buffers delivered since the last health check (guarded by lock)
     private var healthTimer: DispatchSourceTimer?  // repeating main-queue watchdog for the current VP engine
+    private var capture: AVCaptureSession?     // non-nil while built-in mic capture runs instead of the engine
+    private var captureSink: CaptureSink?      // strong ref: AVCaptureAudioDataOutput does not retain its delegate
+    private let captureQueue = DispatchQueue(label: "AudioRecorder.capture")
+
+    /// Device the current or last take was recorded on.
+    var activeDevice: AudioDeviceID { builtDevice }
 
     /// Current system default input device (changes when headphones are plugged/unplugged).
     static func defaultInputDevice() -> AudioDeviceID {
@@ -66,9 +74,16 @@ final class AudioRecorder {
         idleTimer?.cancel()
         idleTimer = nil
         // a warm engine stays bound to the device it was built on: rebuild if the mic changed (headphones unplugged)
-        if engine?.isRunning != true || builtVP != wantVP() || builtDevice != Self.defaultInputDevice() {
-            shutdown()          // tear down any stopped/broken or mismatched engine
-            try buildEngine(allowVP: true)
+        let target = DeviceInfo.recordingInput(preferBuiltIn: preferBuiltIn)
+        let useCapture = target != Self.defaultInputDevice()
+        let isRunningNow = engine?.isRunning == true || capture?.isRunning == true
+        if !isRunningNow || builtDevice != target || (capture != nil) != useCapture || (!useCapture && builtVP != wantVP()) {
+            shutdown()          // tear down any stopped/broken or mismatched engine or capture
+            if useCapture {
+                try buildCapture(device: target)
+            } else {
+                try buildEngine(allowVP: true)
+            }
         } else if builtVP, let e = engine {
             scheduleHealthCheck(e) // warm VP engine reused: resume the watchdog for this take
         }
@@ -117,7 +132,7 @@ final class AudioRecorder {
         if pendingDone != nil { finishPostRoll() } // deliver the pending post-roll take before tearing down
         idleTimer?.cancel()
         idleTimer = nil
-        guard engine != nil else { return }
+        guard engine != nil || capture != nil else { return }
         teardownEngine()
         lock.withLock {
             recording = false
@@ -155,21 +170,11 @@ final class AudioRecorder {
         }
         // With voice processing the pre-start format is wrong (reports 3 ch, stream is 5 ch): let the engine pick
         // the live format and build the converter from the first buffer's real format.
-        var converter: AVAudioConverter?
-        var convFormat: AVAudioFormat?
+        let cache = ConverterCache()
         input.installTap(onBus: 0, bufferSize: 4096, format: vp ? nil : inFormat) { [weak self] buffer, _ in
             guard let self = self else { return }
             self.lock.withLock { self.tapBuffers += 1 }
-            let f = buffer.format
-            if converter == nil || convFormat != f {
-                guard let c = AVAudioConverter(from: f, to: Self.outFormat) else { return }
-                if f.channelCount > 1 {
-                    c.channelMap = [NSNumber(value: 0)] // voice processing may report multichannel input
-                }
-                converter = c
-                convFormat = f
-            }
-            if let c = converter { self.process(buffer, converter: c) }
+            self.feed(buffer, cache: cache)
         }
         fresh.prepare()
         do {
@@ -186,8 +191,56 @@ final class AudioRecorder {
         if vp { scheduleHealthCheck(fresh) }
     }
 
+    /// Builds and starts built-in mic capture (AVCaptureSession). Used when the default input is a Bluetooth headset:
+    /// the headset then stays in music mode. Samples and pre-roll are left untouched.
+    private func buildCapture(device: AudioDeviceID) throws {
+        guard let cam = AVCaptureDevice(uniqueID: DeviceInfo.uid(device) ?? "") else {
+            throw Self.error(2, "Microphone not found")
+        }
+        let session = AVCaptureSession()
+        let input = try AVCaptureDeviceInput(device: cam)
+        guard session.canAddInput(input) else { throw Self.error(4, "Cannot add capture input") }
+        session.addInput(input)
+        let output = AVCaptureAudioDataOutput() // no audioSettings: deliver the device's native format
+        guard session.canAddOutput(output) else { throw Self.error(4, "Cannot add capture output") }
+        let cache = ConverterCache()
+        let sink = CaptureSink { [weak self] buffer in
+            guard let self = self else { return }
+            self.lock.withLock { self.tapBuffers += 1 }
+            self.feed(buffer, cache: cache)
+        }
+        output.setSampleBufferDelegate(sink, queue: captureQueue)
+        session.addOutput(output)
+        session.startRunning()
+        guard session.isRunning else { throw Self.error(3, "Capture did not start") }
+        capture = session
+        captureSink = sink
+        builtDevice = device
+        builtVP = false
+        voiceProcessingActive = false
+        lock.withLock { tapBuffers = 0 }
+    }
+
+    /// Converts one input buffer to 16 kHz mono and passes it to process(). The cache keeps the converter
+    /// while the input format stays the same.
+    private func feed(_ buffer: AVAudioPCMBuffer, cache: ConverterCache) {
+        let f = buffer.format
+        if cache.converter == nil || cache.format != f {
+            guard let c = AVAudioConverter(from: f, to: Self.outFormat) else { return }
+            if f.channelCount > 1 {
+                c.channelMap = [NSNumber(value: 0)] // voice processing or capture may report multichannel input
+            }
+            cache.converter = c
+            cache.format = f
+        }
+        if let c = cache.converter { process(buffer, converter: c) }
+    }
+
     private func teardownEngine() {
         cancelHealthCheck()
+        capture?.stopRunning()
+        capture = nil
+        captureSink = nil
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         // voice processing lives in the shared IO unit: switch it off explicitly or the next plain engine gets no input
@@ -269,6 +322,8 @@ final class AudioRecorder {
         let count = Int(out.frameLength)
         guard count > 0 else { return }
         let chunk = Array(UnsafeBufferPointer(start: channel, count: count))
+        // Bluetooth delivers about 0.5 s of all-zero buffers before real audio: ready waits for a non-zero sample
+        let audible = chunk.contains { $0 != 0 }
 
         let (live, firstBuffer) = lock.withLock { () -> (Bool, Bool) in
             ring.append(contentsOf: chunk)
@@ -277,8 +332,8 @@ final class AudioRecorder {
             }
             guard recording else { return (false, false) }
             samples.append(contentsOf: chunk)
-            let first = !readyFired
-            readyFired = true
+            let first = !readyFired && audible
+            if first { readyFired = true }
             return (true, first)
         }
         guard live else { return }
@@ -323,5 +378,34 @@ final class AudioRecorder {
 
     private static func error(_ code: Int, _ message: String) -> NSError {
         NSError(domain: "Audio", code: code, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+}
+
+/// Holds the converter for one input format (used from the tap or capture thread only).
+private final class ConverterCache {
+    var converter: AVAudioConverter?
+    var format: AVAudioFormat?
+}
+
+/// Receives AVCaptureSession audio and hands each block to `handler` as an AVAudioPCMBuffer.
+private final class CaptureSink: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private let handler: (AVAudioPCMBuffer) -> Void
+
+    init(_ handler: @escaping (AVAudioPCMBuffer) -> Void) {
+        self.handler = handler
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
+        let maybeFormat: AVAudioFormat? = AVAudioFormat(cmAudioFormatDescription: desc)
+        let frames = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard let format = maybeFormat, frames > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)) else { return }
+        buffer.frameLength = AVAudioFrameCount(frames)
+        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(sampleBuffer, at: 0, frameCount: Int32(frames),
+                                                                  into: buffer.mutableAudioBufferList)
+        guard status == noErr else { return }
+        handler(buffer)
     }
 }

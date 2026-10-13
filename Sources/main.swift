@@ -185,6 +185,8 @@ final class App: NSObject, NSApplicationDelegate {
         window.settings.setAppStyles(appStyleRows())
         window.overview.setNetworkPlan(Cleaner.networkPlan(cfg: cfg), offline: cfg.offlineOnly)
         recorder.noiseMode = cfg.noiseMode
+        recorder.preferBuiltIn = cfg.micPreferBuiltIn
+        window.settings.setMicPreferBuiltIn(cfg.micPreferBuiltIn)
         window.settings.setSettings(hotkeyLabel: cfg.hotkeyLabel, forceClick: cfg.forceClick, noiseMode: cfg.noiseMode, polish: cfg.polish)
         window.settings.setExtra(twoPass: cfg.twoPass, launchAtLogin: SMAppService.mainApp.status == .enabled)
         window.overview.setLexicon(manual: cfg.dictionary.count, learnedTerms: cfg.learnedTerms.count,
@@ -207,6 +209,13 @@ final class App: NSObject, NSApplicationDelegate {
         }
         window.settings.onToggleForceClick = { [weak self] on in self?.cfg.forceClick = on; self?.cfg.save(); self?.applyConfig() }
         window.settings.onToggleNoiseMode = { [weak self] on in self?.cfg.noiseMode = on; self?.cfg.save(); self?.applyConfig() }
+        window.settings.onTogglePreferBuiltIn = { [weak self] on in
+            guard let self else { return }
+            self.cfg.micPreferBuiltIn = on
+            self.cfg.save()
+            self.applyConfig()
+            self.showMic(announce: true)
+        }
         window.settings.onChangePolish = { [weak self] mode in self?.cfg.polish = mode; self?.cfg.save(); self?.applyConfig() }
         window.settings.onToggleTwoPass = { [weak self] on in self?.cfg.twoPass = on; self?.cfg.save(); self?.applyConfig() }
         window.settings.onToggleLaunchAtLogin = { [weak self] on in
@@ -241,7 +250,6 @@ final class App: NSObject, NSApplicationDelegate {
             self.cfg.polish = keep.polish
             self.applyConfig()
         }
-        var lastMic: String?
         // cloud provider / local model changed in the 模型 page: pick up new credentials and server state
         window.models.onCloudSaved = { [weak self] in
             guard let self else { return }
@@ -252,15 +260,28 @@ final class App: NSObject, NSApplicationDelegate {
             self.hud.show("云端模型已更新", autoHide: 1.2)
         }
         window.models.onModelActivated = { [weak self] in self?.refreshStatus() }
-        DeviceInfo.observe { [weak self] dev in
+        DeviceInfo.observe { [weak self] _ in
             guard let self else { return }
-            let name = dev?.name ?? "未检测到麦克风"
-            self.window.overview.setMic(name: name, symbol: dev?.symbol ?? "mic.slash", builtIn: dev?.isBuiltIn ?? false)
-            // announce real switches only (not the first report at launch), next to the mouse
-            if let prev = lastMic, prev != name, !self.recorder.isRecording {
-                self.hud.show("🎙 已切换到 \(name)", at: CGEvent(source: nil)?.location, autoHide: 1.8)
-            }
-            lastMic = name
+            self.showMic(announce: self.micShown != nil)   // the first report at launch is not announced
+        }
+    }
+
+    private var micShown: String?   // "default>recording" device pair last shown; a change is announced
+
+    /// Shows the device the next take will record from (may differ from the system default: Bluetooth → built-in).
+    /// With `announce`, a real switch is also shown next to the mouse.
+    private func showMic(announce: Bool) {
+        let def = DeviceInfo.currentInput()
+        let rec = DeviceInfo.info(DeviceInfo.recordingInput(preferBuiltIn: cfg.micPreferBuiltIn))
+        let name = rec?.name ?? "未检测到麦克风"
+        window.overview.setMic(name: name, symbol: rec?.symbol ?? "mic.slash", builtIn: rec?.isBuiltIn ?? false)
+        let key = "\(def?.id ?? 0)>\(rec?.id ?? 0)"
+        defer { micShown = key }
+        if announce, key != micShown, !recorder.isRecording {
+            let msg = def != nil && def?.id != rec?.id
+                ? "🎧 \(def!.name) 只放声音 · 录音用 \(name)"
+                : "🎙 已切换到 \(name)"
+            hud.show(msg, at: CGEvent(source: nil)?.location, autoHide: 2.2)
         }
     }
 
@@ -288,6 +309,7 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     private func refreshStatus() {
+        showMic(announce: true)   // the lid can close/open without a device-change event
         refreshStats()
         if !tapOK && AXIsProcessTrusted() { tapOK = trigger.start() }
         // Secure Keyboard Entry (password fields, some terminals) silently blinds every event tap
@@ -696,6 +718,7 @@ final class App: NSObject, NSApplicationDelegate {
         var row: [String: Any] = ["ts": ISO8601DateFormatter().string(from: Date()), "app": app, "raw": raw, "clean": clean,
                                   "polish": cfg.polish, "two_pass": cfg.twoPass, "asr_ms": asrMs, "first_ms": firstMs,
                                   "total_ms": totalMs]
+        if let mic = DeviceInfo.info(recorder.activeDevice)?.name { row["mic"] = mic }
         if let swap { row["swap"] = swap }
         if let refined, refined != clean { row["refined_unapplied"] = refined }   // second pass had a fix but couldn't apply it
         appendJSONL(row, to: "history.jsonl")

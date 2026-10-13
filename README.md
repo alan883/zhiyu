@@ -67,6 +67,8 @@ Zhiyu has three goals: fast, accurate, and fluent. It is free. All audio stays o
 - Force-click the trackpad as an alternative to the hotkey.
 - Hands-free: double-tap the hotkey to keep recording. Press once more to stop.
 - Mic awareness: shows the current microphone (built-in, wired headset, or Bluetooth). It rebuilds the audio pipeline when you plug or unplug headphones.
+- Bluetooth headphones: by default Zhiyu records from the built-in Mac microphone and the headphones only play sound. Turn this off in Settings. With the lid closed, the built-in mic is off, so Zhiyu uses the headset mic.
+- The ready sound plays only after real audio arrives. Start speaking after the sound and the first word is not cut.
 
 ### Recognition and correction
 
@@ -212,7 +214,8 @@ The design came from measurements, not guesses. Six decisions shaped the app:
 3. **A cloud LLM changed the meaning.** One model rewrote "Fable 5.1" as its own name and deleted half a sentence. The faithfulness guard now rejects those changes.
 4. **Backspace edits broke in terminals.** The first "fix after it appears" version used Backspace keystrokes. In terminal apps such as Claude Code, many keystrokes were dropped and text was duplicated. The rule is now: never edit text that cannot be verified. Native apps get a verified in-place replacement through Accessibility. Terminals, browsers, and Electron apps wait up to 1.2 s for the polish, then type the text once.
 5. **The built-in MacBook microphone was unreliable with Apple's voice processing.** "Noisy environment mode" is now opt-in. It falls back automatically.
-6. **Only tested models are listed.** A model appears in the download list only after it loads and transcribes on the test Mac.
+6. **Bluetooth headset mics are not used.** Opening a Bluetooth mic switches the headset into call mode: music drops to low quality and AirPods flip between transparency and noise cancellation. On an M1 with AirPods, the first 0.5–0.6 s of audio was silence. Software cannot avoid this switch, so Zhiyu records from the built-in mic. A wired headset also works.
+7. **Only tested models are listed.** A model appears in the download list only after it loads and transcribes on the test Mac.
 
 ## Limitations and roadmap
 

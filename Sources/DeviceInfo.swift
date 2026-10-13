@@ -1,5 +1,6 @@
 import CoreAudio
 import Foundation
+import IOKit
 
 struct InputDevice: Equatable {
     let id: AudioDeviceID
@@ -48,12 +49,66 @@ enum DeviceInfo {
         return status == noErr ? id : kAudioObjectUnknown
     }
 
-    /// System default input device, or nil if none.
-    static func currentInput() -> InputDevice? {
-        let id = defaultInputID()
+    /// Input device description for `id`, or nil for kAudioObjectUnknown.
+    static func info(_ id: AudioDeviceID) -> InputDevice? {
         guard id != kAudioObjectUnknown else { return nil }
         let name = deviceName(id)
         return InputDevice(id: id, name: name, transport: inputTransport(id, name: name))
+    }
+
+    /// System default input device, or nil if none.
+    static func currentInput() -> InputDevice? {
+        info(defaultInputID())
+    }
+
+    /// First device with BuiltIn transport that has input streams (the internal mic), or nil.
+    static func builtInMicID() -> AudioDeviceID? {
+        var addr = address(kAudioHardwarePropertyDevices)
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size) == noErr else { return nil }
+        var ids = [AudioDeviceID](repeating: kAudioObjectUnknown,
+                                  count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &ids) == noErr else { return nil }
+        return ids.first { transportName($0) == "内置" && hasInputStreams($0) }
+    }
+
+    /// True when the device exposes at least one input stream.
+    private static func hasInputStreams(_ id: AudioDeviceID) -> Bool {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams,
+                                              mScope: kAudioObjectPropertyScopeInput,
+                                              mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        return AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr && size > 0
+    }
+
+    /// True when the MacBook lid is closed (IOPMrootDomain AppleClamshellState).
+    static func isLidClosed() -> Bool {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard service != 0 else { return false }
+        defer { IOObjectRelease(service) }
+        let closed = IORegistryEntryCreateCFProperty(service, "AppleClamshellState" as CFString,
+                                                     kCFAllocatorDefault, 0)?.takeRetainedValue() as? Bool
+        return closed ?? false
+    }
+
+    /// Persistent UID string of the device, or nil on error.
+    static func uid(_ id: AudioDeviceID) -> String? {
+        var addr = address(kAudioDevicePropertyDeviceUID)
+        var uid: CFString = "" as CFString
+        var size = UInt32(MemoryLayout<CFString>.size)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &uid) == noErr else { return nil }
+        return uid as String
+    }
+
+    /// Device to record from. With preferBuiltIn, a Bluetooth default input is replaced by the
+    /// built-in mic (the headset then stays in music mode and starts ~0.5 s faster), unless the
+    /// lid is closed (built-in mic is off then) or no built-in mic exists.
+    static func recordingInput(preferBuiltIn: Bool) -> AudioDeviceID {
+        let def = defaultInputID()
+        guard preferBuiltIn, def != kAudioObjectUnknown, transportName(def) == "蓝牙",
+              !isLidClosed(), let b = builtInMicID() else { return def }
+        return b
     }
 
     /// Calls `onChange` on main now and whenever the default input device
