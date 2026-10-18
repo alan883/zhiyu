@@ -23,7 +23,11 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     private(set) var window: NSWindow?
     private var selectedIndex = -1
 
-    private static let frameName = "ZhiyuMain"
+    /// Own key, not setFrameAutosaveName: AppKit's autosave also stores sizes the app never chose
+    /// (it once saved 1852×483 on a 1440-wide screen and restored it on every launch).
+    /// This key is written only when the user finishes dragging the window.
+    private static let frameKey = "ZhiyuMainFrame.v2"
+    private static let defaultSize = NSSize(width: 880, height: 560)
 
     private var panes: [NSViewController] { [overview, settings, models, dictionary, history] }
 
@@ -39,6 +43,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     func show() {
         if window == nil { buildWindow() }
+        if let w = window { restoreFrame(w) }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate()
     }
@@ -93,15 +98,44 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         w.delegate = self
         w.contentViewController = split
         w.contentMinSize = NSSize(width: 760, height: 480)
-        w.setContentSize(NSSize(width: 880, height: 560))
-        if !w.setFrameUsingName(Self.frameName) { w.center() }
-        w.setFrameAutosaveName(Self.frameName)
+        UserDefaults.standard.removeObject(forKey: "NSWindow Frame ZhiyuMain")   // drop the old bad autosave
 
         window = w
         select(0)
     }
 
+    /// The user's saved frame if it still fits the screen, else the default size centred.
+    private func restoreFrame(_ w: NSWindow) {
+        let screen = (w.screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 870)
+        let minSize = w.frameRect(forContentRect: NSRect(origin: .zero, size: w.contentMinSize)).size
+        if let str = UserDefaults.standard.string(forKey: Self.frameKey) {
+            let f = NSRectFromString(str)
+            if f.width >= minSize.width, f.height >= minSize.height, screen.contains(f) {
+                w.setFrame(f, display: true)
+                return
+            }
+        }
+        var f = w.frameRect(forContentRect: NSRect(origin: .zero, size: Self.defaultSize))
+        f.size.width = min(f.width, screen.width)
+        f.size.height = min(f.height, screen.height)
+        f.origin = NSPoint(x: screen.midX - f.width / 2, y: screen.midY - f.height / 2)
+        w.setFrame(f, display: true)
+    }
+
+    private func saveFrame(_ w: NSWindow) {
+        UserDefaults.standard.set(NSStringFromRect(w.frame), forKey: Self.frameKey)
+    }
+
     // MARK: NSWindowDelegate
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        if let w = notification.object as? NSWindow { saveFrame(w) }
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        // only moves while the user drags; programmatic setFrame during restore is skipped
+        if let w = notification.object as? NSWindow, w.isVisible, w.inLiveResize || NSEvent.pressedMouseButtons != 0 { saveFrame(w) }
+    }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)

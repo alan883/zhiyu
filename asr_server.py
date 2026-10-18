@@ -33,7 +33,7 @@ LLM_CHECK_S = 30.0
 MODELS_FILE = os.path.join(os.path.expanduser("~"), ".config", "zhiyu", "models.json")
 MIRROR_ENDPOINT = "https://hf-mirror.com"
 DOWNLOAD_FAIL_MSG = "下载失败（网络或磁盘），可重试或换镜像"
-SERVER_VERSION = 7
+SERVER_VERSION = 8
 STREAM_REPO = "csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en"
 STREAM_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt")
 STREAM_IDLE_S = 60.0
@@ -182,6 +182,24 @@ def collapse_repeats(text: str) -> str:
         if new == text:
             return text
         text = new
+
+
+def _squash(s: str) -> str:
+    return re.sub(r"[\W_]+", "", s).lower()
+
+
+def echoes_hotwords(text: str, hotwords: list[str] | None) -> bool:
+    """Qwen3-ASR sometimes reads the hotword list back instead of the speech
+    ("Fable 5.1, GPT-6-Astra, Handy, …"). Real speech almost never says three list
+    entries back to back in list order, so that pattern marks an echo."""
+    if not hotwords or len(hotwords) < 3:
+        return False
+    t = _squash(text)
+    for i in range(len(hotwords) - 2):
+        run = _squash("".join(hotwords[i:i + 3]))
+        if len(run) >= 6 and run in t:
+            return True
+    return False
 
 
 def cap_length(text: str, dur: float) -> str:
@@ -943,9 +961,15 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 r = generate_audio(model, MODEL, audio, hotwords=hotwords or None,
                                    max_tokens=int(dur * CHARS_PER_SEC) + 24)   # language: auto-detect (mixed zh/en)
+                echoed = echoes_hotwords(result_text(r), hotwords)
+                if echoed:   # model read the hotword list back: redo without it
+                    r = generate_audio(model, MODEL, audio, hotwords=None,
+                                       max_tokens=int(dur * CHARS_PER_SEC) + 24)
             finally:
                 _lock.release()
             raw = cap_length(collapse_repeats(result_text(r)), dur)
+            if echoed:
+                print(f"[asr] hotword echo, retried without hotwords: {raw[:60]}", file=sys.stderr, flush=True)
             text, events = phonetic_fix(raw, hotwords)
             similar = list(dict.fromkeys(e["to"] for e in events if e.get("action") == "suggest"))[:10]
             fixes = [[e["from"], e["to"]] for e in events if e.get("action") == "replace"]
