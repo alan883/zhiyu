@@ -18,6 +18,7 @@ final class ModelsPane: NSViewController {
     private var pollTimer: Timer?
     private var selectedFolder = ""
     private var guideFetched = false
+    private var lastSig = ""
     private var awaitingInstall: Set<String> = []        // "下载并启用" started, not yet active
     private var justInstalled: Set<String> = []          // shows "✓ 已安装并启用" for 2 s
 
@@ -226,13 +227,18 @@ final class ModelsPane: NSViewController {
         ModelAPI.list(cfg: ZConfig.load()) { [weak self] items in
             DispatchQueue.main.async {
                 guard let self = self else { return }
+                let sig = (items ?? []).map { "\($0.id)|\($0.downloaded)|\($0.active)|\($0.downloading)|\($0.progress ?? -1)" }.joined(separator: ";")
+                let changed = !self.loaded || self.listFailed != (items == nil) || sig != self.lastSig
+                self.lastSig = sig
                 self.loaded = true
                 self.listFailed = items == nil
                 self.models = items ?? []
                 self.noteInstalls()
-                self.renderLocal()
-                if self.visible && self.models.contains(where: { $0.downloading }) {
-                    self.startPolling()
+                if changed { self.renderLocal() }   // the 3 s idle poll must not rebuild rows under the cursor
+                // also poll while idle: the model can change outside this page (another client, the server's
+                // auto-activate after a download), and the page used to keep showing the old 使用中 row
+                if self.visible {
+                    self.startPolling(every: self.models.contains(where: { $0.downloading }) ? 1 : 3)
                 } else {
                     self.stopPolling()
                 }
@@ -253,9 +259,11 @@ final class ModelsPane: NSViewController {
         }
     }
 
-    private func startPolling() {
-        guard visible, pollTimer == nil else { return }
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+    private func startPolling(every interval: TimeInterval) {
+        guard visible else { return }
+        if let t = pollTimer, t.timeInterval == interval { return }
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.fetchModels()
         }
     }
@@ -543,7 +551,7 @@ final class ModelsPane: NSViewController {
                 if ok {
                     self.downloadErrors[id] = nil
                     self.awaitingInstall.insert(id)
-                    self.startPolling()   // the timer refreshes the row within a second
+                    self.startPolling(every: 1)   // the timer refreshes the row within a second
                 } else {
                     self.downloadErrors[id] = "下载启动失败"
                     self.fetchModels()
