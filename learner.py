@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 D = os.path.expanduser("~/.config/zhiyu")
 CONFIG_PATH = os.path.join(D, "config.json")
 MODEL = "deepseek-v4.1-flash"
-LLM_TIMEOUT_S = 60
+LLM_TIMEOUT_S = 120   # gemini-3.8-flash-high took 52 s for a 40-row batch (10-19)
 MAX_BATCH = 40
 MAX_TERMS = 300
 MAX_CORRECTIONS = 300
@@ -878,7 +878,8 @@ def load_llm_config():
     base = cfg.get("llm_base_url")
     if not isinstance(base, str) or not base.strip():
         return None
-    model = cfg.get("llm_model")
+    # learner_model: the learner runs in the background, so it may use a slower, stronger model than polish
+    model = cfg.get("learner_model") or cfg.get("llm_model")
     model = model.strip() if isinstance(model, str) and model.strip() else MODEL
     # the app passes the key in the environment; reading the Keychain from here would prompt the user
     key = os.environ.get("ZHIYU_LLM_KEY", "") or (cfg.get("llm_key") if isinstance(cfg.get("llm_key"), str) else "")
