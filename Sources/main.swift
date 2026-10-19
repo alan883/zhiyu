@@ -15,6 +15,7 @@ final class App: NSObject, NSApplicationDelegate {
         let selection: String?     // non-nil: the user selected text before speaking => voice command on it
         var retried = false
         var audio: String? = nil   // file name in audio/ (kept for replay / re-transcribe in 历史记录)
+        var preview = ""           // live-preview text: tells the server which dictionary words were likely said
     }
 
     private var statusItem: NSStatusItem!
@@ -26,6 +27,8 @@ final class App: NSObject, NSApplicationDelegate {
     private lazy var window = MainWindowController(configDir: cfgDir)
     private var server: Process?
     private var learner: Process?
+    private var lastPreview = ""
+    private lazy var review = ReviewCard(lexURL: URL(fileURLWithPath: cfgDir + "/lexicon.json"))
     private var target: TextTarget?
     private var selection: String?
     private var jobs: [Job] = []          // sentences recorded while an earlier one is still processing
@@ -66,6 +69,7 @@ final class App: NSObject, NSApplicationDelegate {
         recorder.onLevel = { [weak self] v in self?.hud.level(v) }
         livePreview.onText = { [weak self] t in
             guard let self, self.recorder.isRecording else { return }
+            self.lastPreview = t
             self.hud.preview(t)
         }
         recorder.onReady = { NSSound(named: "Tink")?.play() }
@@ -215,6 +219,14 @@ final class App: NSObject, NSApplicationDelegate {
             self.cfg.polish = keep.polish
             self.applyConfig()
         }
+        review.onChanged = { [weak self] in self?.window.dictionary.onChanged?(); self?.window.dictionary.reload() }
+        review.onOpenDictionary = { [weak self] in
+            guard let self else { return }
+            self.window.show()
+            self.window.select(3)
+            self.window.dictionary.showPending()
+        }
+        offerNewPending()
         // cloud provider / local model changed in the 模型 page: pick up new credentials and server state
         window.models.onCloudSaved = { [weak self] in
             guard let self else { return }
@@ -319,6 +331,7 @@ final class App: NSObject, NSApplicationDelegate {
             try recorder.start()
             let what = selection != nil ? "说出修改指令…（改写选中文字）" : "听着… " + (target.map { "→ \($0.appName)" } ?? "→ 当前焦点")
             hud.show(processing ? "听着…（上一句还在处理）" : what, at: p)
+            lastPreview = ""
             if cfg.livePreview, selection == nil { livePreview.start(recorder) }
         } catch {
             hud.show("录音失败：\(error.localizedDescription)", at: p, autoHide: 3)
@@ -333,7 +346,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     private func end() {
         livePreview.stop()
-        let tgt = target, sel = selection
+        let tgt = target, sel = selection, pv = lastPreview
         recorder.stop(postRoll: 0.25) { [weak self] wav in   // keep listening a moment so the last word isn't clipped
             guard let self else { return }
             guard !wav.isEmpty else {
@@ -342,7 +355,7 @@ final class App: NSObject, NSApplicationDelegate {
                 if !self.processing { self.hud.show("没收到声音：麦克风已重置，请再说一次", autoHide: 2.5) }
                 return
             }
-            self.jobs.append(Job(wav: wav, target: tgt, selection: sel, audio: self.saveAudio(wav)))
+            self.jobs.append(Job(wav: wav, target: tgt, selection: sel, audio: self.saveAudio(wav), preview: pv))
             self.processNext()
         }
     }
@@ -354,7 +367,7 @@ final class App: NSObject, NSApplicationDelegate {
         hud.level(0)
         hud.show("识别中…")
         let t0 = Date()
-        ASRClient.transcribe(wav: job.wav, hotwords: cfg.allTerms, cfg: cfg) { [weak self] r in
+        ASRClient.transcribe(wav: job.wav, hotwords: cfg.allTerms, preview: job.preview, cfg: cfg) { [weak self] r in
             guard let self else { return }
             switch r {
             case .failure(let e):
@@ -663,9 +676,21 @@ final class App: NSObject, NSApplicationDelegate {
                 self.cfg = ZConfig.load()
                 self.cfg.polish = keep.polish
                 self.applyConfig()
+                self.offerNewPending()
             }
         }
         do { try p.run(); learner = p } catch { log("learner spawn failed: \(error)") }
+    }
+
+    /// Pairs the learner queued that the user has not been shown yet get a review card.
+    private func offerNewPending() {
+        let key = "reviewShown"
+        var shown = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        let fresh = PendingStore.load(URL(fileURLWithPath: cfgDir + "/lexicon.json")).filter { !shown.contains("\($0.wrong)→\($0.right)") }
+        guard !fresh.isEmpty else { return }
+        fresh.forEach { shown.insert("\($0.wrong)→\($0.right)") }
+        UserDefaults.standard.set(Array(shown), forKey: key)
+        review.offer(fresh)
     }
 
     private func lexiconUpdated() -> String? {
@@ -677,7 +702,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     // MARK: ASR server
 
-    static let serverVersion = 8
+    static let serverVersion = 9
 
     /// An ASR server left over from an older app build keeps answering /health but lacks new endpoints:
     /// if its version is older than ours, stop it so startServerIfNeeded() spawns the current one.

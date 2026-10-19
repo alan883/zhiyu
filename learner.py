@@ -100,7 +100,7 @@ def load_dictionary(path):
 
 
 def fresh_lexicon():
-    return {"version": 1, "terms": [], "corrections": [], "candidates": {},
+    return {"version": 2, "terms": [], "corrections": [], "pending": [], "term_hits": {}, "candidates": {},
             "rejected": {"terms": [], "corrections": []},
             "cursor": {"history": 0, "edits": 0, "claude_bytes": None, "polish": 0, "redo": 0}, "updated": None}
 
@@ -140,10 +140,62 @@ def load_lexicon(path):
     rej = lex["rejected"] if isinstance(lex["rejected"], dict) else {}
     lex["rejected"] = {"terms": rej.get("terms") if isinstance(rej.get("terms"), list) else [],
                        "corrections": rej.get("corrections") if isinstance(rej.get("corrections"), list) else []}
+    if not isinstance(lex.get("pending"), list):
+        lex["pending"] = []
+    if not isinstance(lex.get("term_hits"), dict):
+        lex["term_hits"] = {}
+    if not isinstance(data.get("version"), int) or data["version"] < 2:
+        # v2: a correction is a silent, global text replacement, so only rules the user confirmed may be one.
+        # Rules learned before v2 by the LLM or from polish go back to the review queue.
+        keep = []
+        for c in lex["corrections"]:
+            if isinstance(c, dict) and c.get("source") in ("llm", "polish", "redo"):
+                lex["pending"].append({"wrong": c.get("wrong"), "right": c.get("right"),
+                                       "hits": c.get("hits", 1), "source": c.get("source")})
+            else:
+                keep.append(c)
+        lex["corrections"] = keep
+        lex["version"] = 2
     return lex
 
 
+def merge_user_changes(path, lex):
+    """The app edits lexicon.json while a learner run (up to ~1 min with the LLM) holds an older copy.
+    The user's decisions win: rules and rejections made meanwhile are kept, and confirmed or rejected
+    pairs leave the pending queue."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            disk = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not isinstance(disk, dict):
+        return
+    if isinstance(disk.get("corrections"), list):
+        mine = {(c.get("wrong"), c.get("right")) for c in lex["corrections"]}
+        for c in disk["corrections"]:
+            if isinstance(c, dict) and c.get("confirmed") and (c.get("wrong"), c.get("right")) not in mine:
+                lex["corrections"].append(c)
+        # unless lists are edited in the app only
+        unl = {(c.get("wrong"), c.get("right")): c.get("unless") for c in disk["corrections"]
+               if isinstance(c, dict) and c.get("unless")}
+        for c in lex["corrections"]:
+            if (c.get("wrong"), c.get("right")) in unl:
+                c["unless"] = unl[(c.get("wrong"), c.get("right"))]
+    rej = disk.get("rejected") if isinstance(disk.get("rejected"), dict) else {}
+    for key in ("terms", "corrections"):
+        for item in rej.get(key) or []:
+            if item not in lex["rejected"][key]:
+                lex["rejected"][key].append(item)
+    rej_pairs = rejected_sets(lex)[1]
+    lex["corrections"] = [c for c in lex["corrections"] if (c.get("wrong"), c.get("right")) not in rej_pairs]
+    rules = {(c.get("wrong"), c.get("right")) for c in lex["corrections"]}
+    lex["pending"] = [c for c in lex["pending"] if (c.get("wrong"), c.get("right")) not in rules | rej_pairs]
+    rej_terms = rejected_sets(lex)[0]
+    lex["terms"] = [t for t in lex["terms"] if t not in rej_terms]
+
+
 def write_lexicon(path, lex):
+    merge_user_changes(path, lex)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".lexicon-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -240,7 +292,8 @@ CJK_RE_CLASS = "[\u4e00-\u9fff]"
 
 
 def add_correction(lex, wrong, right, source, hits, dict_terms):
-    """Returns True if a new correction entry was created."""
+    """Queues wrong→right for the user to confirm (lexicon "pending"); the app turns a confirmed pair into a rule.
+    Returns True if a new pending entry was created. A pair that is already a rule only gets its hits bumped."""
     if re.sub(r"\s+", "", wrong) == re.sub(r"\s+", "", right) or "\n" in wrong or "\n" in right:
         return False  # whitespace/soft-wrap differences are not recognition errors
     if (wrong, right) in rejected_sets(lex)[1]:
@@ -254,8 +307,20 @@ def add_correction(lex, wrong, right, source, hits, dict_terms):
         if c.get("wrong") == wrong and c.get("right") == right:
             c["hits"] = c.get("hits", 0) + hits
             return False
-    lex["corrections"].append({"wrong": wrong, "right": right, "hits": hits, "source": source})
+    for c in lex["pending"]:
+        if c.get("wrong") == wrong and c.get("right") == right:
+            c["hits"] = c.get("hits", 0) + hits
+            return False
+    lex["pending"].append({"wrong": wrong, "right": right, "hits": hits, "source": source})
     return True
+
+
+def suggest_term_only(lex, right, dict_terms):
+    """AI-made fixes (LLM pass, cloud polish) never become rules: OpenLess #917 saw such rules loop and misfire.
+    Only the corrected word is kept, as a hint term."""
+    if is_term_like(right) and term_ok(right) and add_term(lex, right, dict_terms):
+        return [right]
+    return []
 
 
 def add_term(lex, term, dict_terms):
@@ -448,14 +513,14 @@ def candidate_ok(key, ctx, lex, dict_terms):
 def purge_unverified(lex, ctx, dict_terms):
     # the user's own hand-fixes are ground truth even if the spelling never appears in the seed corpus
     rej_terms, rej_pairs = rejected_sets(lex)
-    edit_rights = {c.get("right") for c in lex["corrections"] if c.get("source") == "edit"}
+    edit_rights = {c.get("right") for c in lex["corrections"] if c.get("source") == "edit" or c.get("confirmed")}
     lex["terms"] = [t for t in lex["terms"] if isinstance(t, str) and t not in rej_terms
                     and (t in edit_rights or verified_term(t, ctx))]
     lex["candidates"] = {k: n for k, n in lex["candidates"].items() if candidate_ok(k, ctx, lex, dict_terms)}
     lex["corrections"] = [c for c in lex["corrections"]
                           if isinstance(c.get("wrong"), str) and isinstance(c.get("right"), str)
                           and (c["wrong"], c["right"]) not in rej_pairs
-                          and (c.get("source") == "edit" or verified_pair(c["wrong"], c["right"], ctx, lex, dict_terms))]
+                          and (c.get("source") == "edit" or c.get("confirmed") or verified_pair(c["wrong"], c["right"], ctx, lex, dict_terms))]
 
 
 def shannon_entropy(s):
@@ -798,6 +863,9 @@ def count_pending(lex, pairs, source, dict_terms):
         lex["candidates"][key] = n
         if n < PROMOTE_AT:
             continue
+        if source == "polish":
+            added_terms += suggest_term_only(lex, right, dict_terms)
+            continue
         if add_correction(lex, wrong, right, source, 1, dict_terms):
             added_corr.append(f"{wrong}→{right}")
         if is_term_like(right) and term_ok(right) and add_term(lex, right, dict_terms):
@@ -962,10 +1030,7 @@ def accept_corrections(lex, corrections, ctx, dict_terms):
         lex["candidates"][key] = n
         verbatim = sum(1 for raw in ctx["raws"] if wrong in raw)
         if n >= PROMOTE_AT or verbatim >= 2:
-            if add_correction(lex, wrong, right, "llm", n, dict_terms):
-                added_corr.append(key)
-            if add_term(lex, right, dict_terms):
-                added_terms.append(right)
+            added_terms += suggest_term_only(lex, right, dict_terms)
     return added_terms, added_corr
 
 
@@ -989,8 +1054,22 @@ def llm_pass(lex, batch, dict_terms, ctx, creds):
 
 # ---------- finalize ----------
 
+TERM_HITS_ROWS = 1500
+
+
+def count_term_hits(lex, dict_terms, history):
+    """Uses of each term in recent dictations. The app sends the most-used terms to the recognizer first:
+    in OpenLess #917 the three most-hit words never fit the hotword budget because the list was in insertion order."""
+    terms = list(dict.fromkeys(list(dict_terms) + lex["terms"]))
+    texts = [str_field(r, "clean").lower() for r in history[-TERM_HITS_ROWS:]]
+    lex["term_hits"] = {t: n for t in terms if (n := sum(t.lower() in x for x in texts))}
+
+
 def prune(lex, dict_terms):
     lex["corrections"] = [c for c in lex["corrections"] if c.get("wrong") not in dict_terms]
+    rejected = rejected_sets(lex)[1]
+    lex["pending"] = [c for c in lex["pending"] if isinstance(c, dict) and c.get("wrong") not in dict_terms
+                      and (c.get("wrong"), c.get("right")) not in rejected][-MAX_CORRECTIONS:]
     if len(lex["terms"]) > MAX_TERMS:
         lex["terms"] = lex["terms"][-MAX_TERMS:]
     corr = lex["corrections"]
@@ -1048,6 +1127,7 @@ def process(paths):
             err = f"{type(exc).__name__}: {exc}"
 
     purge_unverified(lex, ctx, dict_terms)
+    count_term_hits(lex, dict_terms, history)
     prune(lex, dict_terms)
     lex["updated"] = datetime.now().astimezone().isoformat(timespec="seconds")
     write_lexicon(paths["lexicon"], lex)

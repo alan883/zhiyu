@@ -33,7 +33,7 @@ LLM_CHECK_S = 30.0
 MODELS_FILE = os.path.join(os.path.expanduser("~"), ".config", "zhiyu", "models.json")
 MIRROR_ENDPOINT = "https://hf-mirror.com"
 DOWNLOAD_FAIL_MSG = "下载失败（网络或磁盘），可重试或换镜像"
-SERVER_VERSION = 8
+SERVER_VERSION = 9
 STREAM_REPO = "csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en"
 STREAM_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt")
 STREAM_IDLE_S = 60.0
@@ -202,16 +202,40 @@ def echoes_hotwords(text: str, hotwords: list[str] | None) -> bool:
     return False
 
 
+CONTEXT_TERMS = 24      # words given to the recognizer per take (the rest only feed the sound-alike fixer)
+CONTEXT_HEARD_MAX = 8   # of those, at most this many picked because the live preview contains them
+
+
+def select_context(terms: list[str], preview: str) -> list[str]:
+    """Qwen3-ASR gets worse as unrelated words pile up in its context (Huber & Waibel 2026: +39–570% errors with
+    250 distractors, fine with 10) and sometimes reads the list back (Qwen3-ASR #106/#140). So it gets the
+    words the live preview already heard (exact or sound-alike), then the client's most-used words."""
+    heard = []
+    if preview:
+        p = _squash(preview)
+        heard = [t for t in terms if len(_squash(t)) >= 2 and _squash(t) in p]
+        _, events = phonetic_fix(preview, terms)
+        heard += [e["to"] for e in events if e.get("to") in terms]
+    out = []
+    for t in heard[:CONTEXT_HEARD_MAX] + terms:
+        if t not in out:
+            out.append(t)
+        if len(out) >= CONTEXT_TERMS:
+            break
+    return out
+
+
 def cap_length(text: str, dur: float) -> str:
     limit = int(dur * CHARS_PER_SEC) + 30
     return text[:limit] if len(text) > limit else text
 
 
-def parse_corrections(raw) -> list[tuple[str, str]]:
+def parse_corrections(raw) -> list[tuple[str, str, list[str]]]:
     out = []
     for c in raw or []:
         if isinstance(c, dict) and isinstance(c.get("wrong"), str) and c["wrong"] and isinstance(c.get("right"), str):
-            out.append((c["wrong"], c["right"]))
+            unless = [u for u in c.get("unless") or [] if isinstance(u, str) and u]
+            out.append((c["wrong"], c["right"], unless))
     return out
 
 
@@ -225,8 +249,10 @@ def replace_word(text: str, wrong: str, right: str) -> str:
     return re.sub(pat, lambda _: right, text)
 
 
-def rules_clean(text: str, corrections: list[tuple[str, str]]) -> str:
-    for wrong, right in sorted(corrections, key=lambda c: len(c[0]), reverse=True):
+def rules_clean(text: str, corrections: list[tuple[str, str, list[str]]]) -> str:
+    for wrong, right, unless in sorted(corrections, key=lambda c: len(c[0]), reverse=True):
+        if any(u.lower() in text.lower() for u in unless):
+            continue   # blacklist: a word nearby says this is not the misheard term
         text = replace_word(text, wrong, right)
     text = FILLER_RE.sub("", text)
     text = EN_FILLER_RE.sub("", text)
@@ -950,6 +976,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             audio = decode_wav(self._read_body())
             hotwords = decode_hotwords(self.headers.get("X-Hotwords"))
+            try:
+                preview = base64.b64decode(self.headers.get("X-Preview") or "").decode("utf-8")
+            except Exception:
+                preview = ""
+            context = select_context(hotwords, preview)
             dur = audio.size / TARGET_SR
             t0 = time.perf_counter()
             _asr_waiting.set()
@@ -959,9 +990,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             _asr_waiting.clear()
             try:
-                r = generate_audio(model, MODEL, audio, hotwords=hotwords or None,
+                r = generate_audio(model, MODEL, audio, hotwords=context or None,
                                    max_tokens=int(dur * CHARS_PER_SEC) + 24)   # language: auto-detect (mixed zh/en)
-                echoed = echoes_hotwords(result_text(r), hotwords)
+                echoed = echoes_hotwords(result_text(r), context)
                 if echoed:   # model read the hotword list back: redo without it
                     r = generate_audio(model, MODEL, audio, hotwords=None,
                                        max_tokens=int(dur * CHARS_PER_SEC) + 24)

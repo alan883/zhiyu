@@ -25,7 +25,8 @@ struct ZConfig {
     var launchAtLogin = false
     var dictionary: [String] = []
     var learnedTerms: [String] = []
-    var corrections: [(wrong: String, right: String)] = []
+    var corrections: [Correction] = []
+    var termHits: [String: Int] = [:]   // uses in recent dictations, counted by learner.py
     var offlineOnly = false
     var autoSend = true
     var handsFree = true
@@ -52,9 +53,15 @@ struct ZConfig {
         set { polish = newValue ? "auto" : "fast" }
     }
 
+    /// Most useful first, because only the head of this list reaches the recognizer: the 5 newest manual words
+    /// (you just added them, likely because they were misheard), then every term by recent use.
+    /// OpenLess #917: in insertion order, the 3 most-used words never fit the hotword budget.
     var allTerms: [String] {
         var seen = Set<String>()
-        return (dictionary + learnedTerms).filter { seen.insert($0).inserted }
+        let rest = (dictionary + learnedTerms).enumerated()
+            .sorted { (termHits[$0.element] ?? 0, -$0.offset) > (termHits[$1.element] ?? 0, -$1.offset) }
+            .map(\.element)
+        return (dictionary.suffix(5) + rest).filter { seen.insert($0).inserted }
     }
 
     /// Reasoning models spend the whole output budget "thinking" unless told not to. DeepSeek hosts get
@@ -125,8 +132,9 @@ struct ZConfig {
         c.learnedTerms = ((lex?["terms"] as? [String]) ?? []).filter { !$0.isEmpty }
         c.corrections = ((lex?["corrections"] as? [[String: Any]]) ?? []).compactMap { d in
             guard let w = d["wrong"] as? String, let r = d["right"] as? String, !w.isEmpty else { return nil }
-            return (wrong: w, right: r)
+            return Correction(wrong: w, right: r, unless: (d["unless"] as? [String]) ?? [])
         }
+        c.termHits = ((lex?["term_hits"] as? [String: Any]) ?? [:]).compactMapValues { ($0 as? NSNumber)?.intValue }
 
         // key priority: Keychain > config.json llm_key
         let kc = Keychain.get() ?? ""
@@ -419,14 +427,19 @@ enum ASRClient {
         return URLSession(configuration: cfg)
     }()
 
-    static func transcribe(wav: Data, hotwords: [String], cfg: ZConfig, completion: @escaping (Result<ASRResult, Error>) -> Void) {
+    /// `hotwords` goes to the server in priority order (all of it feeds the sound-alike fixer; the server passes only the
+    /// head plus the words heard in `preview` to the recognizer). `preview`: the live-preview text of this take, if any.
+    static func transcribe(wav: Data, hotwords: [String], preview: String = "", cfg: ZConfig, completion: @escaping (Result<ASRResult, Error>) -> Void) {
         var req = URLRequest(url: cfg.asrURL.appendingPathComponent("transcribe"))
         req.httpMethod = "POST"
         req.timeoutInterval = 20
         req.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
-        let hw = Array(hotwords.prefix(60))
+        let hw = Array(hotwords.prefix(300))
         if !hw.isEmpty, let j = try? JSONSerialization.data(withJSONObject: hw) {
             req.setValue(j.base64EncodedString(), forHTTPHeaderField: "X-Hotwords")
+        }
+        if !preview.isEmpty {
+            req.setValue(Data(preview.utf8).base64EncodedString(), forHTTPHeaderField: "X-Preview")
         }
         session.uploadTask(with: req, from: wav) { data, _, err in
             let result: Result<ASRResult, Error>
@@ -809,7 +822,7 @@ enum Cleaner {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body: [String: Any] = [
             "text": text, "app": appName, "context": ctx,
-            "terms": Array(cfg.allTerms.prefix(80)), "corrections": cfg.corrections.map { ["wrong": $0.wrong, "right": $0.right] },
+            "terms": Array(cfg.allTerms.prefix(80)), "corrections": cfg.corrections.map { ["wrong": $0.wrong, "right": $0.right, "unless": $0.unless] as [String: Any] },
             "style_hint": styleHint(style) ?? "",
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { DispatchQueue.main.async { completion(nil) }; return }
@@ -837,7 +850,7 @@ enum Cleaner {
         var out = cfg.corrections
             .filter { !$0.wrong.isEmpty }
             .sorted { $0.wrong.count > $1.wrong.count }
-            .reduce(s) { replaceWord($0, $1.wrong, $1.right) }
+            .reduce(s) { $1.blocked(in: $0) ? $0 : replaceWord($0, $1.wrong, $1.right) }
         let steps: [(pattern: String, template: String)] = [
             ("(?i)\\b(?:umm?|uhh?m?|erm|hmm)\\b[,，]?[ \\t]*", ""),
             ("(^|[，。！？、 ])(?:(?:呃|嗯|额|唔|(?i:emm))[，、]?)+", "$1"),
@@ -905,5 +918,17 @@ enum Cleaner {
             return String(s.dropFirst().dropLast())
         }
         return s
+    }
+}
+
+/// A confirmed replacement rule. `unless`: words that, when present in the sentence, stop the rule
+/// (asr-hotword's blacklist idea: 傅平 ~~~ 扶贫 keeps "扶贫办" from becoming "傅平办").
+struct Correction {
+    let wrong: String
+    let right: String
+    var unless: [String] = []
+
+    func blocked(in text: String) -> Bool {
+        unless.contains { !$0.isEmpty && text.localizedCaseInsensitiveContains($0) }
     }
 }

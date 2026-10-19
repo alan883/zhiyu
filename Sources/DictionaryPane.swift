@@ -1,19 +1,20 @@
 import AppKit
 
-/// 个人词典面板：手动词典 / 自动学到 / 纠错规则 三个标签页。
+/// 个人词典面板：手动词典 / 自动学到 / 纠错规则 / 待确认 四个标签页。
 /// 数据文件：configDir/dictionary.txt（手动词，# 为注释）、configDir/lexicon.json（学到的词与纠错）。
 final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
 
     /// 任何写盘成功后调用
     var onChanged: (() -> Void)?
 
-    private enum Tab: Int { case manual, auto, corr }
+    private enum Tab: Int { case manual, auto, corr, pending }
 
     private struct Correction {
         let wrong: String
         let right: String
         let hits: Int
         let source: String
+        var unless: [String] = []
     }
 
     private let dictURL: URL
@@ -28,6 +29,7 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
     private var manualRaw: [Int] = []
     private var terms: [String] = []
     private var corrections: [Correction] = []
+    private var pending: [PendingStore.Item] = []
 
     // MARK: - Init
 
@@ -45,7 +47,7 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
     // MARK: - Controls
 
     private lazy var segmented: NSSegmentedControl = {
-        let s = NSSegmentedControl(labels: ["手动词典 (0)", "自动学到 (0)", "纠错规则 (0)"],
+        let s = NSSegmentedControl(labels: ["手动词典 (0)", "自动学到 (0)", "纠错规则 (0)", "待确认 (0)"],
                                    trackingMode: .selectOne, target: self, action: #selector(tabChanged))
         s.selectedSegment = 0
         s.segmentStyle = .automatic
@@ -107,6 +109,14 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
         self.modernButton("添加", symbol: "plus", prominent: true, action: #selector(addWord))
     }()
 
+    private lazy var yesButton: NSButton = {
+        self.modernButton("记住所选", symbol: "checkmark", prominent: true, action: #selector(confirmSelected))
+    }()
+
+    private lazy var noButton: NSButton = {
+        self.modernButton("不要所选", symbol: "xmark", prominent: false, action: #selector(rejectSelected))
+    }()
+
     private lazy var minusButton: NSButton = {
         let b = self.modernButton("", symbol: "minus", prominent: false, action: #selector(deleteSelected))
         b.toolTip = "删除所选"
@@ -150,7 +160,7 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
         let title = NSTextField(labelWithString: "个人词典")
         title.font = .systemFont(ofSize: 26, weight: .bold)
 
-        let subtitle = NSTextField(labelWithString: "自动学习：你手动改过 2 次的词会被记住；也可以手动添加。")
+        let subtitle = NSTextField(labelWithString: "学到的纠错先放进「待确认」，你点「记住」才生效。规则的「例外词」出现在句子里时，这条规则不改字。")
         subtitle.font = .systemFont(ofSize: 13)
         subtitle.textColor = .secondaryLabelColor
 
@@ -161,7 +171,7 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
 
-        let bar = NSStackView(views: [addFieldContainer, plusButton, minusButton])
+        let bar = NSStackView(views: [addFieldContainer, plusButton, yesButton, noButton, minusButton])
         // the glass holder has no intrinsic width: give the field a real width and let it take the free space
         addFieldContainer.translatesAutoresizingMaskIntoConstraints = false
         addFieldContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
@@ -292,8 +302,10 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
             Correction(wrong: (c["wrong"] as? String) ?? "",
                        right: (c["right"] as? String) ?? "",
                        hits: (c["hits"] as? NSNumber)?.intValue ?? 0,
-                       source: (c["source"] as? String) ?? "")
+                       source: (c["source"] as? String) ?? "",
+                       unless: (c["unless"] as? [String]) ?? [])
         }
+        pending = PendingStore.load(lexURL)
     }
 
     private func refreshUI() {
@@ -301,9 +313,13 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
         segmented.setLabel("手动词典 (\(words.count))", forSegment: 0)
         segmented.setLabel("自动学到 (\(terms.count))", forSegment: 1)
         segmented.setLabel("纠错规则 (\(corrections.count))", forSegment: 2)
+        segmented.setLabel("待确认 (\(pending.count))", forSegment: 3)
         let editing = tab == .manual
         addFieldContainer.isHidden = !editing
         plusButton.isHidden = !editing
+        yesButton.isHidden = tab != .pending
+        noButton.isHidden = tab != .pending
+        minusButton.isHidden = tab == .pending
         tableView.reloadData()
         emptyLabel.isHidden = rowCount > 0
     }
@@ -313,6 +329,7 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
         case .manual: return words.count
         case .auto: return terms.count
         case .corr: return corrections.count
+        case .pending: return pending.count
         }
     }
 
@@ -325,6 +342,8 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
         case .manual, .auto:
             specs = [("word", "词", 400)]
         case .corr:
+            specs = [("wrong", "识别成", 150), ("right", "改为", 150), ("hits", "次数", 50), ("source", "来源", 90), ("unless", "例外词（逗号分隔，双击编辑）", 200)]
+        case .pending:
             specs = [("wrong", "识别成", 180), ("right", "改为", 180), ("hits", "次数", 70), ("source", "来源", 200)]
         }
         // 单列标签页不显示表头
@@ -467,7 +486,32 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
                 $0 < corrections.count ? (corrections[$0].wrong, corrections[$0].right) : nil
             }
             didWrite(deleteCorrections(items))
+        case .pending:
+            rejectSelected()
         }
+    }
+
+    /// Opens the 待确认 tab (from the review card's 去确认 button).
+    func showPending() {
+        _ = view
+        segmented.selectedSegment = Tab.pending.rawValue
+        tabChanged()
+    }
+
+    private var selectedPending: [(wrong: String, right: String)] {
+        tableView.selectedRowIndexes.compactMap { $0 < pending.count ? (pending[$0].wrong, pending[$0].right) : nil }
+    }
+
+    @objc private func confirmSelected() {
+        let items = selectedPending
+        guard !items.isEmpty else { NSSound.beep(); return }
+        didWrite(PendingStore.confirm(items, url: lexURL))
+    }
+
+    @objc private func rejectSelected() {
+        let items = selectedPending
+        guard !items.isEmpty else { NSSound.beep(); return }
+        didWrite(PendingStore.reject(items, url: lexURL))
     }
 
     // MARK: - Table
@@ -488,10 +532,15 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
         case (.corr, "wrong"): text = corrections[row].wrong
         case (.corr, "right"): text = corrections[row].right
         case (.corr, "hits"): text = String(corrections[row].hits)
-        default: text = sourceLabel(corrections[row].source)
+        case (.corr, "unless"): text = corrections[row].unless.joined(separator: "，")
+        case (.corr, _): text = sourceLabel(corrections[row].source)
+        case (.pending, "wrong"): text = pending[row].wrong
+        case (.pending, "right"): text = pending[row].right
+        case (.pending, "hits"): text = String(pending[row].hits)
+        case (.pending, _): text = sourceLabel(pending[row].source)
         }
         cell.textField?.stringValue = text
-        cell.textField?.isEditable = (tab == .manual)
+        cell.textField?.isEditable = tab == .manual || (tab == .corr && id.rawValue == "unless")
         return cell
     }
 
@@ -517,12 +566,21 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
         switch s {
         case "edit": return "你的修改"
         case "llm": return "AI 复核"
+        case "polish": return "云端润色"
+        case "redo": return "你重说了一遍"
         default: return s
         }
     }
 
     /// 手动词双击编辑后提交
     func controlTextDidEndEditing(_ obj: Notification) {
+        if tab == .corr, let field = obj.object as? NSTextField {
+            let row = tableView.row(for: field)
+            guard row >= 0, row < corrections.count else { return }
+            let words = field.stringValue.split(whereSeparator: { ",，、 ".contains($0) }).map(String.init)
+            didWrite(PendingStore.setUnless(wrong: corrections[row].wrong, right: corrections[row].right, unless: words, url: lexURL))
+            return
+        }
         guard tab == .manual, let field = obj.object as? NSTextField else { return }
         let row = tableView.row(for: field)
         guard row >= 0, row < words.count else { return }
