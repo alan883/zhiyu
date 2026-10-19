@@ -62,6 +62,15 @@ final class OverviewPane: NSViewController {
 
     private var built = false
 
+    private var wrapping: [NSTextField] = []
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        for t in wrapping where abs(t.preferredMaxLayoutWidth - t.frame.width) > 0.5 {
+            t.preferredMaxLayoutWidth = t.frame.width
+        }
+    }
+
     override func loadView() {
         let root = NSView()
         view = root
@@ -614,6 +623,11 @@ final class OverviewPane: NSViewController {
         t.lineBreakMode = lines == 1 ? .byTruncatingTail : .byWordWrapping
         t.cell?.truncatesLastVisibleLine = true
         t.isSelectable = false
+        // Root cause of the window growing to 2000+ pt: a label asks for the width of its whole text on one line,
+        // at a priority above "keep the window size", so a long last sentence widened the window.
+        // Labels may be squeezed; wrapping ones re-wrap at their real width in viewDidLayout.
+        t.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        if lines != 1 { wrapping.append(t) }
         return t
     }
 

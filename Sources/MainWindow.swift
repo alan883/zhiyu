@@ -123,6 +123,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     }
 
     private func saveFrame(_ w: NSWindow) {
+        guard let screen = (w.screen ?? NSScreen.main)?.visibleFrame, screen.contains(w.frame) else { return }
         UserDefaults.standard.set(NSStringFromRect(w.frame), forKey: Self.frameKey)
     }
 
@@ -412,11 +413,16 @@ fileprivate final class MainWindowDetailVC: NSViewController {
         if paneView.superview !== view {
             paneView.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(paneView)
+            // trailing/bottom sit just below .windowSizeStayPut: a pane may be clipped, but it can never resize the
+            // window (a long label in 概览 once pushed the window to 2258 pt wide)
+            let trailing = paneView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+            let bottom = paneView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+            trailing.priority = NSLayoutConstraint.Priority(NSLayoutConstraint.Priority.windowSizeStayPut.rawValue - 1)
+            bottom.priority = trailing.priority
             NSLayoutConstraint.activate([
                 paneView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-                paneView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
                 paneView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-                paneView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+                trailing, bottom,
             ])
         }
 
