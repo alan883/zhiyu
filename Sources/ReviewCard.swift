@@ -9,15 +9,19 @@ enum PendingStore {
         let right: String
         let hits: Int
         let source: String
+        var isTerm = false   // a new word (wrong == ""), not a replacement rule
+
+        var label: String { isTerm ? "新词：\(right)" : "\(wrong) → \(right)" }
     }
 
     static func load(_ url: URL) -> [Item] {
         guard let d = try? Data(contentsOf: url),
               let root = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { return [] }
         return ((root["pending"] as? [[String: Any]]) ?? []).compactMap { c in
-            guard let w = c["wrong"] as? String, let r = c["right"] as? String, !w.isEmpty else { return nil }
+            let isTerm = (c["kind"] as? String) == "term"
+            guard let w = c["wrong"] as? String, let r = c["right"] as? String, !r.isEmpty, isTerm || !w.isEmpty else { return nil }
             return Item(wrong: w, right: r, hits: (c["hits"] as? NSNumber)?.intValue ?? 0,
-                        source: (c["source"] as? String) ?? "")
+                        source: (c["source"] as? String) ?? "", isTerm: isTerm)
         }
     }
 
@@ -29,6 +33,12 @@ enum PendingStore {
                 let same: ([String: Any]) -> Bool = { ($0["wrong"] as? String) == item.wrong && ($0["right"] as? String) == item.right }
                 guard let i = pending.firstIndex(where: same) else { continue }
                 var c = pending.remove(at: i)
+                if (c["kind"] as? String) == "term" {
+                    var terms = (root["terms"] as? [String]) ?? []
+                    if !terms.contains(item.right) { terms.append(item.right) }
+                    root["terms"] = terms
+                    continue
+                }
                 c["confirmed"] = true
                 if !corr.contains(where: same) { corr.append(c) }
             }
@@ -42,14 +52,20 @@ enum PendingStore {
             var pending = (root["pending"] as? [[String: Any]]) ?? []
             var rejected = (root["rejected"] as? [String: Any]) ?? [:]
             var rejCorr = (rejected["corrections"] as? [[String: Any]]) ?? []
+            var rejTerms = (rejected["terms"] as? [String]) ?? []
             for item in items {
                 pending.removeAll { ($0["wrong"] as? String) == item.wrong && ($0["right"] as? String) == item.right }
+                if item.wrong.isEmpty {   // a new word
+                    if !rejTerms.contains(item.right) { rejTerms.append(item.right) }
+                    continue
+                }
                 if !rejCorr.contains(where: { ($0["wrong"] as? String) == item.wrong && ($0["right"] as? String) == item.right }) {
                     rejCorr.append(["wrong": item.wrong, "right": item.right])
                 }
             }
             root["pending"] = pending
             rejected["corrections"] = rejCorr
+            rejected["terms"] = rejTerms
             root["rejected"] = rejected
         }
     }
@@ -112,7 +128,7 @@ final class ReviewCard: NSObject {
         guard !items.isEmpty else { return }
         if items.count > 3 {
             queue = []
-            show(title: "学到 \(items.count) 条纠错，等你确认", pair: items.prefix(3).map { "\($0.wrong) → \($0.right)" }.joined(separator: "，") + "…",
+            show(title: "学到 \(items.count) 条，等你确认", pair: items.prefix(3).map(\.label).joined(separator: "，") + "…",
                  note: "确认前它们不会改你的字", single: false)
         } else {
             queue = items
@@ -122,8 +138,13 @@ final class ReviewCard: NSObject {
 
     private func next() {
         guard let item = queue.first else { close(); return }
-        show(title: "要记住这个纠错吗？", pair: "\(item.wrong) → \(item.right)",
-             note: "以后识别出「\(item.wrong)」都会改成「\(item.right)」", single: true)
+        if item.isTerm {
+            show(title: "要记住这个新词吗？", pair: item.right,
+                 note: "记住后，识别时会优先认这个词", single: true)
+        } else {
+            show(title: "要记住这个纠错吗？", pair: item.label,
+                 note: "以后识别出「\(item.wrong)」都会改成「\(item.right)」", single: true)
+        }
     }
 
     private func show(title t: String, pair p: String, note n: String, single: Bool) {

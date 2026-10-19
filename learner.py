@@ -189,9 +189,13 @@ def merge_user_changes(path, lex):
     rej_pairs = rejected_sets(lex)[1]
     lex["corrections"] = [c for c in lex["corrections"] if (c.get("wrong"), c.get("right")) not in rej_pairs]
     rules = {(c.get("wrong"), c.get("right")) for c in lex["corrections"]}
-    lex["pending"] = [c for c in lex["pending"] if (c.get("wrong"), c.get("right")) not in rules | rej_pairs]
     rej_terms = rejected_sets(lex)[0]
+    if isinstance(disk.get("terms"), list):   # terms the user confirmed from the review queue meanwhile
+        lex["terms"] += [t for t in disk["terms"] if isinstance(t, str) and t not in lex["terms"]]
     lex["terms"] = [t for t in lex["terms"] if t not in rej_terms]
+    lex["pending"] = [c for c in lex["pending"]
+                      if not (c.get("kind") == "term" and (c.get("right") in lex["terms"] or c.get("right") in rej_terms))
+                      and (c.get("kind") == "term" or (c.get("wrong"), c.get("right")) not in rules | rej_pairs)]
 
 
 def write_lexicon(path, lex):
@@ -315,12 +319,33 @@ def add_correction(lex, wrong, right, source, hits, dict_terms):
     return True
 
 
+@functools.lru_cache(maxsize=1)
+def common_words():
+    try:
+        with open("/usr/share/dict/words", encoding="utf-8", errors="ignore") as f:
+            return frozenset(w.strip().lower() for w in f)
+    except OSError:
+        return frozenset()
+
+
+def ai_term(lex, term, dict_terms):
+    """A term proposed by AI. Ordinary English words wait for the user: on 10-16 the learner took the misheard
+    "Gate" (for Git) as a term because "Gate" also occurs in a document, and that term then biased the
+    recognizer towards "Gate". Returns [term] if the term was added at once."""
+    if not (is_term_like(term) and term_ok(term)):
+        return []
+    if " " not in term and term.lower() in common_words():
+        if term not in lex["terms"] and term not in dict_terms and term not in rejected_sets(lex)[0] \
+                and not any(c.get("kind") == "term" and c.get("right") == term for c in lex["pending"]):
+            lex["pending"].append({"wrong": "", "right": term, "kind": "term", "hits": 1, "source": "llm"})
+        return []
+    return [term] if add_term(lex, term, dict_terms) else []
+
+
 def suggest_term_only(lex, right, dict_terms):
     """AI-made fixes (LLM pass, cloud polish) never become rules: OpenLess #917 saw such rules loop and misfire.
     Only the corrected word is kept, as a hint term."""
-    if is_term_like(right) and term_ok(right) and add_term(lex, right, dict_terms):
-        return [right]
-    return []
+    return ai_term(lex, right, dict_terms)
 
 
 def add_term(lex, term, dict_terms):
@@ -1007,8 +1032,8 @@ def accept_terms(lex, terms, ctx, dict_terms):
     """Terms must occur in the seed corpus; verified terms are promoted at once."""
     added = []
     for term in terms:
-        if term_ok(term) and verified_term(term, ctx) and add_term(lex, term, dict_terms):
-            added.append(term)
+        if term_ok(term) and verified_term(term, ctx):
+            added += ai_term(lex, term, dict_terms)
     return added
 
 
@@ -1068,7 +1093,8 @@ def count_term_hits(lex, dict_terms, history):
 def prune(lex, dict_terms):
     lex["corrections"] = [c for c in lex["corrections"] if c.get("wrong") not in dict_terms]
     rejected = rejected_sets(lex)[1]
-    lex["pending"] = [c for c in lex["pending"] if isinstance(c, dict) and c.get("wrong") not in dict_terms
+    lex["pending"] = [c for c in lex["pending"] if isinstance(c, dict)
+                      and (c.get("kind") == "term" or c.get("wrong") not in dict_terms)
                       and (c.get("wrong"), c.get("right")) not in rejected][-MAX_CORRECTIONS:]
     if len(lex["terms"]) > MAX_TERMS:
         lex["terms"] = lex["terms"][-MAX_TERMS:]

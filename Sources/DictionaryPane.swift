@@ -534,7 +534,7 @@ final class DictionaryPane: NSViewController, NSTableViewDataSource, NSTableView
         case (.corr, "hits"): text = String(corrections[row].hits)
         case (.corr, "unless"): text = corrections[row].unless.joined(separator: "，")
         case (.corr, _): text = sourceLabel(corrections[row].source)
-        case (.pending, "wrong"): text = pending[row].wrong
+        case (.pending, "wrong"): text = pending[row].isTerm ? "（新词）" : pending[row].wrong
         case (.pending, "right"): text = pending[row].right
         case (.pending, "hits"): text = String(pending[row].hits)
         case (.pending, _): text = sourceLabel(pending[row].source)
