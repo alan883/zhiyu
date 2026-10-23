@@ -729,6 +729,11 @@ final class App: NSObject, NSApplicationDelegate {
             p.currentDirectoryURL = URL(fileURLWithPath: self.cfgDir)
             var env = ProcessInfo.processInfo.environment
             env["HF_HUB_OFFLINE"] = "1"   // models already cached; never block on network
+            // The recognizer talks to nothing. A SOCKS proxy inherited from the launching shell makes
+            // huggingface_hub build an httpx client that needs `socksio`, which the venv does not have.
+            for key in ["all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"] {
+                env.removeValue(forKey: key)
+            }
             p.environment = env
             let logURL = URL(fileURLWithPath: self.cfgDir + "/asr_server.log")
             FileManager.default.createFile(atPath: logURL.path, contents: nil)
