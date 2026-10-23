@@ -490,20 +490,16 @@ final class App: NSObject, NSApplicationDelegate {
             self.finishJob(message: out != nil ? "✓ \(text)" : "没找到输入框，已复制到剪贴板（⌘V 粘贴）", hold: 1.0)
             self.noteDictation()
         }
-        // Short and clean: polish changed the words of none of 16 such sentences (history, 10-12/13), so don't wait.
-        // The polish still runs in the background, logged as tag "quick" in polish.jsonl: note "ok" there means
-        // skipping lost a real fix, and the rule should be tightened.
-        if cfg.polish == "auto", Self.quickEnough(fast, asr) {
-            finish(fast, "terminal:quick")
-            Cleaner.refine(fast, appName: appName, contextBefore: ctx, similar: asr.similar, singleLine: true,
-                           style: cfg.style(for: job.target?.bundleID ?? ""), tag: "quick", cfg: cfg) { _ in }
-            return
-        }
-        if cfg.polish != "fast" { hud.show("整理中…") }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { finish(fast, "terminal:deadline") }
+        // Ship at ASR speed. A terminal cannot be corrected after the fact, and a 300-take replay showed the
+        // full-budget polish leaves 64% of sentences byte-identical, so waiting 1.2 s buys almost nothing.
+        // The polish keeps running in the background; when it changes the text, the HUD reports it and the
+        // typed text stays untouched.
+        finish(fast, "terminal:immediate")
+        guard cfg.polish != "fast" else { return }
         Cleaner.refine(fast, appName: appName, contextBefore: ctx, similar: asr.similar, singleLine: true,
-                       style: cfg.style(for: job.target?.bundleID ?? ""), cfg: cfg) { better in
-            finish(better ?? fast, better == nil ? "terminal:\(Cleaner.lastRefineNote)" : "terminal:polished")
+                       style: cfg.style(for: job.target?.bundleID ?? ""), cfg: cfg) { [weak self] better in
+            guard let self, let better, better != fast else { return }
+            self.hud.show("✎ \(better)", autoHide: 3.5)
         }
     }
 

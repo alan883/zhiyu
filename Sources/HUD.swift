@@ -25,9 +25,14 @@ final class HUD {
         static let minW: CGFloat = 220, maxW: CGFloat = 560
         static let barWeights: [CGFloat] = [0.55, 0.8, 1.0, 0.8, 0.55]
         static let previewChars = 34
+        // Multi-line: past maxW the text wraps and the pill grows downward.
+        static let lineH: CGFloat = 20, vPad: CGFloat = 14, maxLines = 4
+        static let previewCharsWrapped = 160
     }
     private static let labelFont = NSFont.systemFont(ofSize: 15, weight: .medium)
     private let panel: NSPanel
+    private var glassView: NSView?
+    private var materialView: NSView?
     private let label = NSTextField(labelWithString: "")
     private let barsView = BarsView()
     private let iconView = NSImageView()
@@ -62,6 +67,7 @@ final class HUD {
             glass.autoresizingMask = [.width, .height]
             glass.contentView = host
             panel.contentView?.addSubview(glass)
+            glassView = glass
             label.textColor = .labelColor
         } else {
             let bg = NSVisualEffectView(frame: frame)
@@ -72,21 +78,20 @@ final class HUD {
             bg.autoresizingMask = [.width, .height]
             bg.addSubview(host)
             panel.contentView?.addSubview(bg)
+            materialView = bg
             label.textColor = .white
         }
-        let iconFrame = NSRect(x: Metrics.padX, y: (Metrics.height - Metrics.iconH) / 2,
-                               width: Metrics.iconW, height: Metrics.iconH)
-        barsView.frame = iconFrame
-        iconView.frame = iconFrame
-        iconView.imageAlignment = .alignCenter
-        iconView.imageScaling = .scaleNone
         host.addSubview(barsView)
         host.addSubview(iconView)
-        let textX = Metrics.padX + Metrics.iconW + Metrics.gap
+        iconView.imageAlignment = .alignCenter
+        iconView.imageScaling = .scaleNone
         label.font = HUD.labelFont
-        label.frame = NSRect(x: textX, y: (Metrics.height - 20) / 2, width: 260 - textX - Metrics.padX, height: 20)
-        label.autoresizingMask = [.width]   // left edge fixed; text area follows panel width
+        label.maximumNumberOfLines = Metrics.maxLines
+        label.cell?.wraps = true
+        label.cell?.isScrollable = false
+        label.usesSingleLineMode = false
         host.addSubview(label)
+        relayout()
     }
     /// Shows a message. `cgPoint` is a CoreGraphics point (top-left origin of the primary screen).
     func show(_ text: String, at cgPoint: CGPoint? = nil, autoHide: TimeInterval? = nil) {
@@ -95,17 +100,19 @@ final class HUD {
         mode = HUD.classify(text)
         // Success text drops the leading "✓" and the spaces after it
         let shown = mode == .success ? String(String(text.dropFirst()).drop(while: { $0 == " " })) : text
-        label.lineBreakMode = .byTruncatingTail
+        let size = layoutSize(for: shown)
+        label.lineBreakMode = size.height > Metrics.height ? .byWordWrapping : .byTruncatingTail
         label.stringValue = shown
         var origin = panel.frame.origin
         if let p = cgPoint {
             // CG (top-left origin) -> Cocoa (bottom-left origin of the primary screen)
             let h = NSScreen.screens.first?.frame.height ?? 0
-            origin = NSPoint(x: p.x + 14, y: h - p.y - 60)   // just below the cursor
+            origin = NSPoint(x: p.x + 14, y: h - p.y - 12 - size.height)   // top edge 12 pt below the cursor
+        } else {
+            origin.y = panel.frame.maxY - size.height                       // keep the top edge; grow downward
         }
         let wasHidden = !panel.isVisible
         if wasHidden { panel.alphaValue = 0 }
-        let size = NSSize(width: targetWidth(for: shown), height: Metrics.height)
         apply(NSRect(origin: origin, size: size), animated: !wasHidden && cgPoint == nil)
         panel.orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { ctx in
@@ -123,15 +130,17 @@ final class HUD {
     /// Live words while speaking (about 5 calls per second). Keeps the newest words visible.
     func preview(_ text: String) {
         let flat = text.replacingOccurrences(of: "\n", with: " ")
-        let n = Metrics.previewChars
+        let n = Metrics.previewCharsWrapped
         let shown = flat.count > n ? "…" + String(flat.suffix(n)) : flat
         mode = .listening
-        label.lineBreakMode = .byTruncatingHead
+        let size = layoutSize(for: shown)
+        label.lineBreakMode = size.height > Metrics.height ? .byWordWrapping : .byTruncatingHead
         label.stringValue = shown
         updateModeUI()
         if panel.isVisible {
             var f = panel.frame
-            f.size.width = targetWidth(for: shown)
+            f.origin.y = panel.frame.maxY - size.height
+            f.size = size
             apply(f, animated: true)
         }
         syncTimer()
@@ -163,12 +172,34 @@ final class HUD {
         if text.hasPrefix("✓") { return .success }
         return .info
     }
-    /// Width = padding + icon + gap + text + padding, clamped to min...max.
-    private func targetWidth(for s: String) -> CGFloat {
-        let textW = ceil(NSAttributedString(string: s, attributes: [.font: HUD.labelFont]).size().width) + 8   // slack: NSTextField insets
-        return min(max(Metrics.padX * 2 + Metrics.iconW + Metrics.gap + textW, Metrics.minW), Metrics.maxW)
+    /// Fits the text: one line while it fits, then wraps at maxW and grows downward.
+    private func layoutSize(for s: String) -> NSSize {
+        let oneW = ceil(NSAttributedString(string: s, attributes: [.font: HUD.labelFont]).size().width) + 8   // slack: NSTextField insets
+        let maxTextW = Metrics.maxW - (Metrics.padX * 2 + Metrics.iconW + Metrics.gap)
+        if oneW <= maxTextW {
+            return NSSize(width: min(max(Metrics.padX * 2 + Metrics.iconW + Metrics.gap + oneW, Metrics.minW), Metrics.maxW),
+                          height: Metrics.height)
+        }
+        let wrapped = NSAttributedString(string: s, attributes: [.font: HUD.labelFont])
+            .boundingRect(with: NSSize(width: maxTextW, height: .greatestFiniteMagnitude),
+                          options: [.usesLineFragmentOrigin, .usesFontLeading])
+        let lines = min(Metrics.maxLines, max(2, Int((wrapped.height / Metrics.lineH).rounded(.up))))
+        return NSSize(width: Metrics.maxW, height: CGFloat(lines) * Metrics.lineH + Metrics.vPad)
     }
-    /// Sets the panel frame. Animated changes keep the left edge where it is.
+    /// Positions the bars, icon and label for the current panel size (icon stays on the first line).
+    private func relayout() {
+        let h = panel.frame.height
+        let lineTopInset = max(0, (h - Metrics.lineH) / 2 - CGFloat(Metrics.maxLines - 1) * Metrics.lineH / 2)
+        let iconY = h - lineTopInset - Metrics.iconH
+        let iconFrame = NSRect(x: Metrics.padX, y: iconY, width: Metrics.iconW, height: Metrics.iconH)
+        barsView.frame = iconFrame
+        iconView.frame = iconFrame
+        let textX = Metrics.padX + Metrics.iconW + Metrics.gap
+        label.frame = NSRect(x: textX, y: Metrics.vPad / 2,
+                             width: max(40, panel.frame.width - textX - Metrics.padX),
+                             height: max(Metrics.lineH, h - Metrics.vPad))
+    }
+    /// Sets the panel frame; the top edge is preserved so the pill grows downward.
     private func apply(_ f: NSRect, animated: Bool) {
         guard f != panel.frame else { return }
         if animated {
@@ -178,6 +209,13 @@ final class HUD {
             }
         } else {
             panel.setFrame(f, display: true)
+        }
+        relayout()
+        let radius = min(24, f.height / 2)
+        if #available(macOS 26.0, *), let glass = glassView as? NSGlassEffectView {
+            glass.cornerRadius = radius
+        } else if let bg = materialView {
+            bg.layer?.cornerRadius = radius
         }
     }
     /// Picks the icon-area content for the current mode.
