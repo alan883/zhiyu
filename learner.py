@@ -300,6 +300,8 @@ def add_correction(lex, wrong, right, source, hits, dict_terms):
     Returns True if a new pending entry was created. A pair that is already a rule only gets its hits bumped."""
     if re.sub(r"\s+", "", wrong) == re.sub(r"\s+", "", right) or "\n" in wrong or "\n" in right:
         return False  # whitespace/soft-wrap differences are not recognition errors
+    if wrong.lower() == right.lower():
+        return False  # a case-only difference: the rule is case-insensitive, so it can never fire
     if (wrong, right) in rejected_sets(lex)[1]:
         return False  # user deleted this pair
     # Chinese -> English rewrites ("麦克风→Mac") are too easy to hallucinate: only the user's own edits may teach them

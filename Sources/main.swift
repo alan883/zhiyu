@@ -653,7 +653,13 @@ final class App: NSObject, NSApplicationDelegate {
             // anchor on the text that was before the caret, take the region where our text went
             let anchor = String(t.contextBefore.suffix(20))
             var region = Substring(value)
-            if !anchor.isEmpty, let r = value.range(of: anchor, options: .backwards) { region = value[r.upperBound...] }
+            if !anchor.isEmpty {
+                // The anchor must occur exactly once. A repeated phrase would otherwise pick the wrong
+                // copy of the text and teach a correction from something the user never typed.
+                let hits = value.components(separatedBy: anchor).count - 1
+                guard hits == 1, let r = value.range(of: anchor) else { return }
+                region = value[r.upperBound...]
+            }
             let final = String(region.prefix(inserted.count + inserted.count / 2 + 4))
             // terminals soft-wrap long lines (newline + indent in AXValue): whitespace-only differences are not edits
             let squash = { (x: String) in x.components(separatedBy: .whitespacesAndNewlines).joined() }
