@@ -7,7 +7,9 @@ Port of the CapsWriter-Offline hotword idea: CJK terms are matched by pinyin
 from __future__ import annotations
 
 import functools
+import logging
 import re
+import sys
 
 from pypinyin import Style, lazy_pinyin
 from rapidfuzz import fuzz
@@ -37,6 +39,36 @@ _DEFAULT_PROTECT = frozenset(
     我们 你们 他们 自己 问题 模型 系统 文件 代码 测试 功能 需要 应该 已经 还是
     或者 然后 现在 今天 明天 时候 感觉 觉得 比较 非常 其实 就是 直接 主要""".split()
 )
+
+
+# A replay of 2,783 real takes (10-24) found most pinyin replacements broke correct text: "你现在"→"逆向在",
+# "自己深度"→"自寄生度", "上面帮我"→"上面板我", "想法"→"宪法", "的模型"→"大模型". A sound-alike match says nothing
+# about whether the original was wrong, so a span that already reads as ordinary Chinese is left alone.
+_COMMON_WORD_FREQ = 50          # surface is itself a dictionary word at least this frequent: keep it
+_COMMON_CHAR_FREQ = 20000       # two-char span made of two everyday one-char words ("你/想"): keep it
+_EN_WORDS_PATH = "/usr/share/dict/words"
+
+
+@functools.lru_cache(maxsize=1)
+def _jieba():
+    """jieba tokenizer, or None when the package is missing (the corrector then runs without the word checks)."""
+    try:
+        import jieba
+        jieba.setLogLevel(logging.ERROR)
+        jieba.initialize()
+        return jieba
+    except Exception as e:
+        print(f"phonetic: jieba unavailable, word checks off: {e}", file=sys.stderr, flush=True)
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def _english_words() -> frozenset[str]:
+    try:
+        with open(_EN_WORDS_PATH, encoding="utf-8", errors="ignore") as f:
+            return frozenset(w.strip().lower() for w in f if w.strip())
+    except OSError:
+        return frozenset()
 
 
 def _is_cjk(ch: str) -> bool:
@@ -96,7 +128,9 @@ class PhoneticCorrector:
     """Replaces near-homophone spans in text with vocabulary terms."""
 
     def __init__(self, terms: list[str], replace_threshold: float = 0.80,
-                 suggest_threshold: float = 0.6, protect: set[str] | None = None):
+                 suggest_threshold: float = 0.6, protect: set[str] | None = None, guard: bool = True):
+        # guard=False: pure sound comparison, for the learner checking a user's own edit
+        self.guard = guard
         self.replace_threshold = replace_threshold
         self.suggest_threshold = suggest_threshold
         self._protect = _DEFAULT_PROTECT | frozenset(protect or ())
@@ -148,6 +182,10 @@ class PhoneticCorrector:
         if not self._cjk_terms:
             return []
         runs = [(s, [_char_phoneme(c) for c in text[s:e]]) for s, e in _cjk_runs(text)]
+        jb = _jieba() if self.guard else None
+        segs = [(w, a, b) for w, a, b in jb.tokenize(text, HMM=False)] if jb else []
+        bounds = {a for _, a, _ in segs} | {b for _, _, b in segs}
+        freq = jb.dt.FREQ if jb else {}
         out: list[tuple[float, str, int, int, str]] = []
         for term, tp in self._cjk_terms:
             length = len(tp)
@@ -167,6 +205,9 @@ class PhoneticCorrector:
                             break
                     else:
                         score = 1.0 - cost / denom
+                        if score < self.suggest_threshold or (
+                                self.guard and self._reads_fine(term, surface, s, e, segs, bounds, freq)):
+                            continue
                         if score >= self.replace_threshold:
                             action = "replace"
                         elif score >= self.suggest_threshold:
@@ -175,6 +216,28 @@ class PhoneticCorrector:
                             continue
                         out.append((score, term, s, e, action))
         return out
+
+    @staticmethod
+    def _reads_fine(term: str, surface: str, s: int, e: int, segs, bounds, freq) -> bool:
+        """True when the span already reads as ordinary text, so a sound-alike term must not replace it."""
+        diff = [k for k in range(len(term)) if term[k] != surface[k]]
+        # "的模型"→"大模型", "方案是"→"方案一": one edge character differs and the rest is the term itself
+        if len(term) >= 3 and len(diff) == 1 and diff[0] in (0, len(term) - 1):
+            return True
+        if not segs:
+            return False
+        if freq.get(surface, 0) >= _COMMON_WORD_FREQ:              # "想法", "话说", "至于"
+            return True
+        if s not in bounds or e not in bounds:                      # "你|现在", "自己|深度", "上面|帮我"
+            return True
+        inside = [w for w, a, b in segs if a >= s and b <= e]
+        if len(term) == 2 and len(inside) == 2 and all(freq.get(w, 0) >= _COMMON_CHAR_FREQ for w in inside):
+            return True                                             # "你/想", "你/像", "你/向"
+        return False
+
+    @staticmethod
+    def _latin_reads_fine(term: str, window_words: list[str]) -> bool:
+        return _latin_reads_fine_impl(term, window_words)
 
     def _latin_candidates(self, text: str) -> list[tuple[float, str, int, int, str]]:
         if not self._latin_terms:
@@ -203,6 +266,8 @@ class PhoneticCorrector:
                     if surface == term or surface in self._terms:
                         continue
                     window_words = [text[a:b] for a, b in toks[i:i + k]]
+                    if self.guard and self._latin_reads_fine(term, window_words):
+                        continue
                     best, best_cand = 0.0, ""
                     for join in ("", " "):
                         cand = join.join(window_words).lower()
@@ -218,6 +283,28 @@ class PhoneticCorrector:
                         continue
                     out.append((best, term, s, e, "replace"))
         return out
+
+
+def _latin_reads_fine_impl(term: str, window_words: list[str]) -> bool:
+    words = term.split()
+    low = [w.lower() for w in window_words]
+    # "DeepSeek V四点一"→"DeepSeek", "Python C"→"Python": the term is already there, the extra token is real speech
+    n = len(words)
+    tl = [w.lower() for w in words]
+    if any(low[j:j + n] == tl for j in range(len(low) - n + 1)) and len(low) > n:
+        return True
+    joined = "".join(low)
+    if joined == "".join(tl) + "s":                # "Skills"→"Skill", "Pi Agents"→"Pi Agent": plural is speech
+        return True
+    if len(window_words) != 1:
+        return False
+    w = window_words[0]
+    plain = lambda x: x in (x.lower(), x.capitalize())
+    # case only: "skill"→"Skill", "Coding"→"coding" is noise; "CODEX"/"CodeX"→"Codex" is a real fix
+    if w.lower() == term.lower():
+        return plain(w) and plain(term)
+    # "Code"→"Codex", "Goal"→"goal": an English word is a word, not a misspelling
+    return w.lower() in _english_words()
 
 
 @functools.lru_cache(maxsize=32)

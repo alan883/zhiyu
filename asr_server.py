@@ -33,7 +33,7 @@ LLM_CHECK_S = 30.0
 MODELS_FILE = os.path.join(os.path.expanduser("~"), ".config", "zhiyu", "models.json")
 MIRROR_ENDPOINT = "https://hf-mirror.com"
 DOWNLOAD_FAIL_MSG = "下载失败（网络或磁盘），可重试或换镜像"
-SERVER_VERSION = 9
+SERVER_VERSION = 10
 STREAM_REPO = "csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en"
 STREAM_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt")
 STREAM_IDLE_S = 60.0
@@ -92,6 +92,7 @@ REPEAT_RE = re.compile(r"(.{1,12}?)\1{3,}")
 FILLER_RE = re.compile(
     r"(?:^|(?<=[，。！？、\s]))(?:呃|嗯|唔|额(?=[，,、\s]|$)|(?i:emm+|um+|uh+)(?![A-Za-z]))[，,、]?\s*"
 )
+MID_UH_RE = re.compile(r"呃(?!逆)[，,、]?\s*")   # 呃 mid-sentence ("那个呃Codex") is always filler; 呃逆 = hiccup
 EN_FILLER_RE = re.compile(r"(?<!\w)(?:um|umm|uh|uhh|uhm|erm|hmm)(?!\w)[,，、]?\s*", re.IGNORECASE)
 STUTTER_RE = re.compile(r"(我|他|它|这|那|就|不|是|的)\1")
 LEAD_RE = re.compile(r"^(清理后|清理结果|输出)\s*[：:]\s*")
@@ -255,6 +256,7 @@ def rules_clean(text: str, corrections: list[tuple[str, str, list[str]]]) -> str
             continue   # blacklist: a word nearby says this is not the misheard term
         text = replace_word(text, wrong, right)
     text = FILLER_RE.sub("", text)
+    text = MID_UH_RE.sub("", text)
     text = EN_FILLER_RE.sub("", text)
     text = collapse_repeats(text)
     text = STUTTER_RE.sub(r"\1", text)
@@ -1079,6 +1081,7 @@ if __name__ == "__main__":
     model = load_model(MODEL)
     with _lock:
         generate_audio(model, MODEL, np.zeros(16000, dtype=np.float32), hotwords=None)
+    phonetic_fix("预热", ["预热词"])   # loads the word list now (~0.4 s), not inside the first take
     if LLM_MODEL != "none":
         threading.Thread(target=_unload_idle_llm, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)

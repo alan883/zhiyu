@@ -593,7 +593,7 @@ def looks_misheard(wrong, right):
         ph = load_phonetic()
         if ph is None:
             return difflib.SequenceMatcher(None, wrong, right).ratio() >= 0.5
-        _, events = ph.corrector_for((right,)).correct(wrong)
+        _, events = ph.PhoneticCorrector([right], guard=False).correct(wrong)
         return any(ev.get("action") in ("replace", "suggest") for ev in events)
     return difflib.SequenceMatcher(None, wrong.lower(), right.lower()).ratio() >= 0.5
 

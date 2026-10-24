@@ -863,6 +863,7 @@ enum Cleaner {
         let steps: [(pattern: String, template: String)] = [
             ("(?i)\\b(?:umm?|uhh?m?|erm|hmm)\\b[,，]?[ \\t]*", ""),
             ("(^|[，。！？、 ])(?:(?:呃|嗯|额|唔|(?i:emm))[，、]?)+", "$1"),
+            ("呃(?!逆)[，、]?", ""),   // 呃 is never a content word mid-sentence ("那个呃Codex"); 呃逆 = hiccup
             ("([我他它这那就不是的])\\1+", "$1"),
             ("(.{1,6}?)\\1{2,}", "$1"),
         ]

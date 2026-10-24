@@ -717,7 +717,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     // MARK: ASR server
 
-    static let serverVersion = 9
+    static let serverVersion = 10
 
     /// An ASR server left over from an older app build keeps answering /health but lacks new endpoints:
     /// if its version is older than ours, stop it so startServerIfNeeded() spawns the current one.
