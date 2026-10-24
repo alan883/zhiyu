@@ -203,6 +203,7 @@ def echoes_hotwords(text: str, hotwords: list[str] | None) -> bool:
     return False
 
 
+CONTEXT_CHARS = 200     # at most this much preceding text goes to the recognizer as context
 CONTEXT_TERMS = 24      # words given to the recognizer per take (the rest only feed the sound-alike fixer)
 CONTEXT_HEARD_MAX = 8   # of those, at most this many picked because the live preview contains them
 
@@ -983,6 +984,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 preview = ""
             context = select_context(hotwords, preview)
+            try:   # text before the cursor / recent dictation: Qwen3-ASR takes free text as context in its system prompt
+                before = base64.b64decode(self.headers.get("X-Context") or "").decode("utf-8").strip()[-CONTEXT_CHARS:]
+            except Exception:
+                before = ""
             dur = audio.size / TARGET_SR
             t0 = time.perf_counter()
             _asr_waiting.set()
@@ -992,7 +997,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             _asr_waiting.clear()
             try:
-                r = generate_audio(model, MODEL, audio, hotwords=context or None,
+                r = generate_audio(model, MODEL, audio, hotwords=context or None, system_prompt=before or None,
                                    max_tokens=int(dur * CHARS_PER_SEC) + 24)   # language: auto-detect (mixed zh/en)
                 echoed = echoes_hotwords(result_text(r), context)
                 if echoed:   # model read the hotword list back: redo without it

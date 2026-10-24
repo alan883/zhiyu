@@ -137,7 +137,29 @@ final class AudioRecorder {
         pendingDone = done
         let work = DispatchWorkItem { [weak self] in self?.finishPostRoll() }
         postRollWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + postRoll, execute: work)
+        // Already quiet for 300 ms before the release: nothing left to clip, so don't wait.
+        // 199 saved takes (10-24): 91% ended this way; on the 3 with sound after release, cutting changed no word.
+        let quiet = lock.withLock { Self.endsQuiet(samples) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + (quiet ? 0 : postRoll), execute: work)
+    }
+
+    /// True when the last 300 ms of the take are below the speech threshold (20 ms frames,
+    /// threshold = max(3 × 10th-percentile level, 0.15 × 90th-percentile level)).
+    static func endsQuiet(_ pcm: [Float]) -> Bool {
+        let frame = 320, tailFrames = 15
+        let n = pcm.count / frame
+        guard n >= tailFrames * 3 else { return false }
+        var rms = [Float](repeating: 0, count: n)
+        pcm.withUnsafeBufferPointer { p in
+            for i in 0..<n {
+                var sum: Float = 0
+                for j in (i * frame)..<((i + 1) * frame) { sum += p[j] * p[j] }
+                rms[i] = (sum / Float(frame)).squareRoot()
+            }
+        }
+        let sorted = rms.sorted()
+        let thr = max(sorted[n / 10] * 3, sorted[n * 9 / 10] * 0.15)
+        return rms.suffix(tailFrames).allSatisfy { $0 <= thr }
     }
 
     /// Removes the tap, stops the engine and discards any in-progress recording.

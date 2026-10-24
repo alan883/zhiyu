@@ -16,6 +16,7 @@ final class App: NSObject, NSApplicationDelegate {
         var retried = false
         var audio: String? = nil   // file name in audio/ (kept for replay / re-transcribe in 历史记录)
         var preview = ""           // live-preview text: tells the server which dictionary words were likely said
+        var released = Date()      // key release: the user's clock starts here, not at the ASR request
     }
 
     private var statusItem: NSStatusItem!
@@ -346,7 +347,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     private func end() {
         livePreview.stop()
-        let tgt = target, sel = selection, pv = lastPreview
+        let tgt = target, sel = selection, pv = lastPreview, releasedAt = Date()
         recorder.stop(postRoll: 0.25) { [weak self] wav in   // keep listening a moment so the last word isn't clipped
             guard let self else { return }
             guard !wav.isEmpty else {
@@ -355,7 +356,7 @@ final class App: NSObject, NSApplicationDelegate {
                 if !self.processing { self.hud.show("没收到声音：麦克风已重置，请再说一次", autoHide: 2.5) }
                 return
             }
-            self.jobs.append(Job(wav: wav, target: tgt, selection: sel, audio: self.saveAudio(wav), preview: pv))
+            self.jobs.append(Job(wav: wav, target: tgt, selection: sel, audio: self.saveAudio(wav), preview: pv, released: releasedAt))
             self.processNext()
         }
     }
@@ -367,6 +368,7 @@ final class App: NSObject, NSApplicationDelegate {
         hud.level(0)
         hud.show("识别中…")
         let t0 = Date()
+        if let a = job.audio { releaseGap[a] = Int(t0.timeIntervalSince(job.released) * 1000) }
         ASRClient.transcribe(wav: job.wav, hotwords: cfg.allTerms, preview: job.preview, cfg: cfg) { [weak self] r in
             guard let self else { return }
             switch r {
@@ -793,6 +795,8 @@ final class App: NSObject, NSApplicationDelegate {
         window.select(3)   // built-in dictionary page; no external editor needed
     }
 
+    private var releaseGap: [String: Int] = [:]   // audio file → ms from key release to ASR request
+
     private func record(raw: String, clean: String, app: String, asrMs: Int, totalMs: Int, firstMs: Int,
                         swap: String? = nil, refined: String? = nil, audio: String? = nil) {
         var row: [String: Any] = ["ts": ISO8601DateFormatter().string(from: Date()), "app": app, "raw": raw, "clean": clean,
@@ -800,6 +804,8 @@ final class App: NSObject, NSApplicationDelegate {
                                   "total_ms": totalMs]
         if let mic = DeviceInfo.info(recorder.activeDevice)?.name { row["mic"] = mic }
         if let audio { row["audio"] = audio }
+        // release_ms = key release → text on screen (post-roll + queue wait + ASR + rules), what the user feels
+        if let audio, let gap = releaseGap.removeValue(forKey: audio) { row["release_ms"] = gap + firstMs }
         Hooks.after(clean, env: ["ZHIYU_APP": app, "ZHIYU_RAW": raw, "ZHIYU_MIC": (row["mic"] as? String) ?? ""])
         if let swap { row["swap"] = swap }
         if let refined, refined != clean { row["refined_unapplied"] = refined }   // second pass had a fix but couldn't apply it
